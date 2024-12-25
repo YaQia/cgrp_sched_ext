@@ -463,6 +463,7 @@ struct task_group {
 #ifdef CONFIG_EXT_GROUP_SCHED
 	u32			scx_flags;	/* SCX_TG_* */
 	u32			scx_weight;
+	struct scx_scheduler	*sched;
 #endif
 
 	struct rcu_head		rcu;
