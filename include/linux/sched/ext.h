@@ -198,7 +198,6 @@ struct sched_ext_entity {
 	/* cold fields */
 #ifdef CONFIG_EXT_GROUP_SCHED
 	struct cgroup		*cgrp_moving_from;
-	struct scx_scheduler	*sched;
 #endif
 	struct list_head	tasks_node;
 };
