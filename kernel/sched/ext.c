@@ -7,37 +7,37 @@
  * Copyright (c) 2022 David Vernet <dvernet@meta.com>
  */
 
-#include <linux/sched/clock.h>
-#include <linux/sched/cputime.h>
-#include <linux/sched/hotplug.h>
-#include <linux/sched/isolation.h>
-#include <linux/sched/posix-timers.h>
-#include <linux/sched/rt.h>
-
-#include <linux/cpuidle.h>
-#include <linux/jiffies.h>
-#include <linux/kobject.h>
-#include <linux/livepatch.h>
-#include <linux/pm.h>
-#include <linux/psi.h>
-#include <linux/rhashtable.h>
-#include <linux/seq_buf.h>
-#include <linux/seqlock_api.h>
-#include <linux/slab.h>
-#include <linux/suspend.h>
-#include <linux/tsacct_kern.h>
-#include <linux/vtime.h>
-#include <linux/sysrq.h>
-#include <linux/percpu-rwsem.h>
-
-#include <uapi/linux/sched/types.h>
-
-#include "sched.h"
-#include "smp.h"
-
-#include "autogroup.h"
-// #include "stats.h"
-#include "pelt.h"
+/*#include <linux/sched/clock.h>*/
+/*#include <linux/sched/cputime.h>*/
+/*#include <linux/sched/hotplug.h>*/
+/*#include <linux/sched/isolation.h>*/
+/*#include <linux/sched/posix-timers.h>*/
+/*#include <linux/sched/rt.h>*/
+/**/
+/*#include <linux/cpuidle.h>*/
+/*#include <linux/jiffies.h>*/
+/*#include <linux/kobject.h>*/
+/*#include <linux/livepatch.h>*/
+/*#include <linux/pm.h>*/
+/*#include <linux/psi.h>*/
+/*#include <linux/rhashtable.h>*/
+/*#include <linux/seq_buf.h>*/
+/*#include <linux/seqlock_api.h>*/
+/*#include <linux/slab.h>*/
+/*#include <linux/suspend.h>*/
+/*#include <linux/tsacct_kern.h>*/
+/*#include <linux/vtime.h>*/
+/*#include <linux/sysrq.h>*/
+/*#include <linux/percpu-rwsem.h>*/
+/**/
+/*#include <uapi/linux/sched/types.h>*/
+/**/
+/*#include "sched.h"*/
+/*#include "smp.h"*/
+/**/
+/*#include "autogroup.h"*/
+/*// #include "stats.h"*/
+/*#include "pelt.h"*/
 
 #define SCX_OP_IDX(op)		(offsetof(struct sched_ext_ops, op) / sizeof(void (*)(void)))
 
@@ -888,15 +888,35 @@ struct scx_scheduler {
 	/* root task group for this scheduler */
 	// struct task_group	*root_tsk_grp;
 	struct sched_ext_ops	scx_ops;
-	// atomic_t		scx_exit_kind;
-	// struct scx_exit_info	*scx_exit_info;
+	atomic_t		scx_exit_kind;
+	struct scx_exit_info	*scx_exit_info;
 	atomic_t		scx_ops_enable_state_var;
 	bool			scx_ops_enq_last:1;
 	bool			scx_ops_enq_exiting:1;
 	bool			scx_ops_cpu_preempt:1;
 	bool			scx_builtin_idle_enabled:1;
+
 	/* use bitmap to reduce memory consumption */
 	DECLARE_BITMAP(scx_has_op, SCX_OPI_END);
+	
+	/*
+	 * The maximum amount of time in jiffies that a task may be runnable without
+	 * being scheduled on a CPU. If this timeout is exceeded, it will trigger
+	 * scx_ops_error().
+	 */
+	unsigned long		scx_watchdog_timeout;
+
+	/*
+	 * The last time the delayed work was run. This delayed work relies on
+	 * ksoftirqd being able to run to service timer interrupts, so it's possible
+	 * that this work itself could get wedged. To account for this, we check that
+	 * it's not stalled in the timer tick, and trigger an error if it is.
+	 */
+	unsigned long		scx_watchdog_timestamp;
+
+	struct delayed_work	scx_watchdog_work;
+	struct kthread_work	scx_ops_disable_work;
+	struct irq_work		scx_ops_error_irq_work;
 } *root;
 
 static DEFINE_PER_CPU(struct scx_scheduler *, _curr_sched);
@@ -940,8 +960,8 @@ static bool scx_warned_zero_slice;
 //
 // DEFINE_STATIC_KEY_ARRAY_FALSE(scx_has_op, MAX_SCHED*SCX_OPI_END);
 
-static atomic_t scx_exit_kind = ATOMIC_INIT(SCX_EXIT_DONE);
-static struct scx_exit_info *scx_exit_info;
+/*static atomic_t scx_exit_kind = ATOMIC_INIT(SCX_EXIT_DONE);*/
+/*static struct scx_exit_info *scx_exit_info;*/
 
 static atomic_long_t scx_nr_rejected = ATOMIC_LONG_INIT(0);
 static atomic_long_t scx_hotplug_seq = ATOMIC_LONG_INIT(0);
@@ -952,23 +972,6 @@ static atomic_long_t scx_hotplug_seq = ATOMIC_LONG_INIT(0);
  * scheduler has ever been used in the system.
  */
 static atomic_long_t scx_enable_seq = ATOMIC_LONG_INIT(0);
-
-/*
- * The maximum amount of time in jiffies that a task may be runnable without
- * being scheduled on a CPU. If this timeout is exceeded, it will trigger
- * scx_ops_error().
- */
-static unsigned long scx_watchdog_timeout;
-
-/*
- * The last time the delayed work was run. This delayed work relies on
- * ksoftirqd being able to run to service timer interrupts, so it's possible
- * that this work itself could get wedged. To account for this, we check that
- * it's not stalled in the timer tick, and trigger an error if it is.
- */
-static unsigned long scx_watchdog_timestamp = INITIAL_JIFFIES;
-
-static struct delayed_work scx_watchdog_work;
 
 /* idle tracking */
 #ifdef CONFIG_SMP
@@ -1141,6 +1144,17 @@ static void scx_kf_disallow(u32 mask)
 	barrier();
 	current->scx.kf_mask &= ~mask;
 }
+
+#define SCX_SCHED_CALL_OP(sched, mask, op, args...)						\
+do {										\
+	if (mask) {								\
+		scx_kf_allow(mask);						\
+		sched->scx_ops.op(args);					\
+		scx_kf_disallow(mask);						\
+	} else {								\
+		sched->scx_ops.op(args);					\
+	}									\
+} while (0)
 
 #define SCX_CALL_OP(mask, op, args...)						\
 do {										\
@@ -3395,7 +3409,7 @@ static bool check_rq_for_timeouts(struct rq *rq)
 		unsigned long last_runnable = p->scx.runnable_at;
 
 		if (unlikely(time_after(jiffies,
-					last_runnable + scx_watchdog_timeout))) {
+			last_runnable + curr_sched->scx_watchdog_timeout))) {
 			u32 dur_ms = jiffies_to_msecs(jiffies - last_runnable);
 
 			scx_ops_error_kind(SCX_EXIT_ERROR_STALL,
@@ -3415,8 +3429,14 @@ static void scx_watchdog_workfn(struct work_struct *work)
 {
 	int cpu;
 
-	WRITE_ONCE(scx_watchdog_timestamp, jiffies);
+	/* instead of curr_sched, we should use the work's own scheduler */
+	struct scx_scheduler *sched = container_of(work, struct scx_scheduler,
+						   scx_watchdog_work.work);
 
+	WRITE_ONCE(sched->scx_watchdog_timestamp, jiffies);
+	/**
+	 * TODO: change this to be the possible range of task group
+	 */
 	for_each_online_cpu(cpu) {
 		if (unlikely(check_rq_for_timeouts(cpu_rq(cpu))))
 			break;
@@ -3424,7 +3444,7 @@ static void scx_watchdog_workfn(struct work_struct *work)
 		cond_resched();
 	}
 	queue_delayed_work(system_unbound_wq, to_delayed_work(work),
-			   scx_watchdog_timeout / 2);
+			   sched->scx_watchdog_timeout / 2);
 }
 
 void scx_tick(struct rq *rq)
@@ -3434,9 +3454,9 @@ void scx_tick(struct rq *rq)
 	if (!scx_enabled())
 		return;
 
-	last_check = READ_ONCE(scx_watchdog_timestamp);
+	last_check = READ_ONCE(curr_sched->scx_watchdog_timestamp);
 	if (unlikely(time_after(jiffies,
-				last_check + READ_ONCE(scx_watchdog_timeout)))) {
+		last_check + READ_ONCE(curr_sched->scx_watchdog_timeout)))) {
 		u32 dur_ms = jiffies_to_msecs(jiffies - last_check);
 
 		scx_ops_error_kind(SCX_EXIT_ERROR_STALL,
@@ -4519,14 +4539,16 @@ static const char *scx_exit_reason(enum scx_exit_kind kind)
 
 static void scx_ops_disable_workfn(struct kthread_work *work)
 {
-	struct scx_exit_info *ei = scx_exit_info;
+	struct scx_scheduler *sched = 
+		container_of(work, struct scx_scheduler, scx_ops_disable_work);
+	struct scx_exit_info *ei = sched->scx_exit_info;
 	struct scx_task_iter sti;
 	struct task_struct *p;
 	struct rhashtable_iter rht_iter;
 	struct scx_dispatch_q *dsq;
 	int i, kind;
 
-	kind = atomic_read(&scx_exit_kind);
+	kind = atomic_read(&sched->scx_exit_kind);
 	while (true) {
 		/*
 		 * NONE indicates that a new scx_ops has been registered since
@@ -4535,7 +4557,8 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 		 */
 		if (kind == SCX_EXIT_NONE || kind == SCX_EXIT_DONE)
 			return;
-		if (atomic_try_cmpxchg(&scx_exit_kind, &kind, SCX_EXIT_DONE))
+		if (atomic_try_cmpxchg(&sched->scx_exit_kind,
+				       &kind, SCX_EXIT_DONE))
 			break;
 	}
 	ei->kind = kind;
@@ -4550,7 +4573,7 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 		break;
 	case SCX_OPS_DISABLED:
 		pr_warn("sched_ext: ops error detected without ops (%s)\n",
-			scx_exit_info->msg);
+			sched->scx_exit_info->msg);
 		WARN_ON_ONCE(scx_ops_set_enable_state(SCX_OPS_DISABLED)
 			     != SCX_OPS_DISABLING);
 		goto done;
@@ -4610,31 +4633,31 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	/* no task is on scx, turn off all the switches and flush in-progress calls */
 	static_branch_disable(&__scx_ops_enabled);
 	for (i = SCX_OPI_BEGIN; i < SCX_OPI_END; i++)
-		clear_bit(i, root->scx_has_op);
-	root->scx_ops_enq_last = false;
-	root->scx_ops_enq_exiting = false;
-	root->scx_ops_cpu_preempt = false;
-	root->scx_builtin_idle_enabled = false;
+		clear_bit(i, sched->scx_has_op);
+	sched->scx_ops_enq_last = false;
+	sched->scx_ops_enq_exiting = false;
+	sched->scx_ops_cpu_preempt = false;
+	sched->scx_builtin_idle_enabled = false;
 	synchronize_rcu();
 
 	if (ei->kind >= SCX_EXIT_ERROR) {
 		pr_err("sched_ext: BPF scheduler \"%s\" disabled (%s)\n",
-		       root->scx_ops.name, ei->reason);
+		       sched->scx_ops.name, ei->reason);
 
 		if (ei->msg[0] != '\0')
-			pr_err("sched_ext: %s: %s\n", root->scx_ops.name, ei->msg);
+			pr_err("sched_ext: %s: %s\n", sched->scx_ops.name, ei->msg);
 #ifdef CONFIG_STACKTRACE
 		stack_trace_print(ei->bt, ei->bt_len, 2);
 #endif
 	} else {
 		pr_info("sched_ext: BPF scheduler \"%s\" disabled (%s)\n",
-			root->scx_ops.name, ei->reason);
+			sched->scx_ops.name, ei->reason);
 	}
 
-	if (root->scx_ops.exit)
-		SCX_CALL_OP(SCX_KF_UNLOCKED, exit, ei);
+	if (sched->scx_ops.exit)
+		SCX_SCHED_CALL_OP(sched, SCX_KF_UNLOCKED, exit, ei);
 
-	cancel_delayed_work_sync(&scx_watchdog_work);
+	cancel_delayed_work_sync(&sched->scx_watchdog_work);
 
 	/*
 	 * Delete the kobject from the hierarchy eagerly in addition to just
@@ -4646,7 +4669,7 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	kobject_put(scx_root_kobj);
 	scx_root_kobj = NULL;
 
-	memset(&root->scx_ops, 0, sizeof(root->scx_ops));
+	memset(&sched->scx_ops, 0, sizeof(sched->scx_ops));
 
 	rhashtable_walk_enter(&dsq_hash, &rht_iter);
 	do {
@@ -4663,8 +4686,8 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	scx_dsp_ctx = NULL;
 	scx_dsp_max_batch = 0;
 
-	free_exit_info(scx_exit_info);
-	scx_exit_info = NULL;
+	free_exit_info(sched->scx_exit_info);
+	sched->scx_exit_info = NULL;
 
 	mutex_unlock(&scx_ops_enable_mutex);
 
@@ -4674,9 +4697,9 @@ done:
 	scx_ops_bypass(false);
 }
 
-static DEFINE_KTHREAD_WORK(scx_ops_disable_work, scx_ops_disable_workfn);
+/*static DEFINE_KTHREAD_WORK(scx_ops_disable_work, scx_ops_disable_workfn);*/
 
-static void schedule_scx_ops_disable_work(void)
+static void schedule_scx_ops_disable_work(struct scx_scheduler *sched)
 {
 	struct kthread_worker *helper = READ_ONCE(scx_ops_helper);
 
@@ -4685,7 +4708,7 @@ static void schedule_scx_ops_disable_work(void)
 	 * scx_ops_helper isn't set up yet, there's nothing to do.
 	 */
 	if (helper)
-		kthread_queue_work(helper, &scx_ops_disable_work);
+		kthread_queue_work(helper, &sched->scx_ops_disable_work);
 }
 
 static void scx_ops_disable(enum scx_exit_kind kind)
@@ -4695,9 +4718,9 @@ static void scx_ops_disable(enum scx_exit_kind kind)
 	if (WARN_ON_ONCE(kind == SCX_EXIT_NONE || kind == SCX_EXIT_DONE))
 		kind = SCX_EXIT_ERROR;
 
-	atomic_try_cmpxchg(&scx_exit_kind, &none, kind);
+	atomic_try_cmpxchg(&curr_sched->scx_exit_kind, &none, kind);
 
-	schedule_scx_ops_disable_work();
+	schedule_scx_ops_disable_work(curr_sched);
 }
 
 static void dump_newline(struct seq_buf *s)
@@ -4980,25 +5003,27 @@ static void scx_dump_state(struct scx_exit_info *ei, size_t dump_len)
 
 static void scx_ops_error_irq_workfn(struct irq_work *irq_work)
 {
-	struct scx_exit_info *ei = scx_exit_info;
+	struct scx_scheduler *sched = 
+		container_of(irq_work, struct scx_scheduler, scx_ops_error_irq_work);
+	struct scx_exit_info *ei = sched->scx_exit_info;
 
 	if (ei->kind >= SCX_EXIT_ERROR)
-		scx_dump_state(ei, root->scx_ops.exit_dump_len);
+		scx_dump_state(ei, sched->scx_ops.exit_dump_len);
 
-	schedule_scx_ops_disable_work();
+	schedule_scx_ops_disable_work(sched);
 }
 
-static DEFINE_IRQ_WORK(scx_ops_error_irq_work, scx_ops_error_irq_workfn);
+/*static DEFINE_IRQ_WORK(scx_ops_error_irq_work, scx_ops_error_irq_workfn);*/
 
 static __printf(3, 4) void scx_ops_exit_kind(enum scx_exit_kind kind,
 					     s64 exit_code,
 					     const char *fmt, ...)
 {
-	struct scx_exit_info *ei = scx_exit_info;
+	struct scx_exit_info *ei = curr_sched->scx_exit_info;
 	int none = SCX_EXIT_NONE;
 	va_list args;
 
-	if (!atomic_try_cmpxchg(&scx_exit_kind, &none, kind))
+	if (!atomic_try_cmpxchg(&curr_sched->scx_exit_kind, &none, kind))
 		return;
 
 	ei->exit_code = exit_code;
@@ -5017,7 +5042,7 @@ static __printf(3, 4) void scx_ops_exit_kind(enum scx_exit_kind kind,
 	ei->kind = kind;
 	ei->reason = scx_exit_reason(ei->kind);
 
-	irq_work_queue(&scx_ops_error_irq_work);
+	irq_work_queue(&curr_sched->scx_ops_error_irq_work);
 }
 
 static struct kthread_worker *scx_create_rt_helper(const char *name)
@@ -5061,6 +5086,30 @@ static int validate_ops(const struct sched_ext_ops *ops)
 	}
 
 	return 0;
+}
+
+static int scx_sched_init(struct scx_scheduler **sched)
+{
+	int ret = 0, i;
+	*sched = kzalloc(sizeof(struct scx_scheduler), GFP_KERNEL);
+	if (!*sched) {
+		ret = -ENOMEM;
+		goto err;
+	}
+	for_each_possible_cpu(i) {
+		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
+		*cpu_sched = *sched;
+	}
+	(*sched)->scx_ops_enable_state_var = (atomic_t)ATOMIC_INIT(SCX_OPS_DISABLED); 
+	(*sched)->scx_watchdog_timestamp = INITIAL_JIFFIES;
+	(*sched)->scx_exit_kind = (atomic_t)ATOMIC_INIT(SCX_EXIT_DONE);
+
+	(*sched)->scx_ops_disable_work = (struct kthread_work)
+		KTHREAD_WORK_INIT((*sched)->scx_ops_disable_work, scx_ops_disable_workfn);
+	(*sched)->scx_ops_error_irq_work = IRQ_WORK_INIT(scx_ops_error_irq_workfn);
+	INIT_DELAYED_WORK(&(*sched)->scx_watchdog_work, scx_watchdog_workfn);
+err:
+	return ret;
 }
 
 static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
@@ -5116,14 +5165,8 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	}
 
 	if (!root) {
-		root = kzalloc(sizeof(struct scx_scheduler), GFP_KERNEL);
-		if (!root) {
-			ret = -ENOMEM;
+		if ((ret = scx_sched_init(&root))) {
 			goto err_unlock;
-		}
-		for_each_possible_cpu(i) {
-			struct scx_scheduler **sched = per_cpu_ptr(&_curr_sched, i);
-			*sched = root;
 		}
 	}
 
@@ -5143,8 +5186,8 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	if (ret < 0)
 		goto err;
 
-	scx_exit_info = alloc_exit_info(ops->exit_dump_len);
-	if (!scx_exit_info) {
+	curr_sched->scx_exit_info = alloc_exit_info(ops->exit_dump_len);
+	if (!curr_sched->scx_exit_info) {
 		ret = -ENOMEM;
 		goto err_del;
 	}
@@ -5158,7 +5201,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	WARN_ON_ONCE(scx_ops_set_enable_state(SCX_OPS_ENABLING) !=
 		     SCX_OPS_DISABLED);
 
-	atomic_set(&scx_exit_kind, SCX_EXIT_NONE);
+	atomic_set(&curr_sched->scx_exit_kind, SCX_EXIT_NONE);
 	scx_warned_zero_slice = false;
 
 	atomic_long_set(&scx_nr_rejected, 0);
@@ -5208,10 +5251,10 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	else
 		timeout = SCX_WATCHDOG_MAX_TIMEOUT;
 
-	WRITE_ONCE(scx_watchdog_timeout, timeout);
-	WRITE_ONCE(scx_watchdog_timestamp, jiffies);
-	queue_delayed_work(system_unbound_wq, &scx_watchdog_work,
-			   scx_watchdog_timeout / 2);
+	WRITE_ONCE(curr_sched->scx_watchdog_timeout, timeout);
+	WRITE_ONCE(curr_sched->scx_watchdog_timestamp, jiffies);
+	queue_delayed_work(system_unbound_wq, &curr_sched->scx_watchdog_work,
+			   curr_sched->scx_watchdog_timeout / 2);
 
 	/*
 	 * Once __scx_ops_enabled is set, %current can be switched to SCX
@@ -5337,7 +5380,8 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	scx_ops_bypass(false);
 
 	if (!scx_ops_tryset_enable_state(SCX_OPS_ENABLED, SCX_OPS_ENABLING)) {
-		WARN_ON_ONCE(atomic_read(&scx_exit_kind) == SCX_EXIT_NONE);
+		WARN_ON_ONCE(atomic_read
+				(&curr_sched->scx_exit_kind) == SCX_EXIT_NONE);
 		goto err_disable;
 	}
 
@@ -5358,9 +5402,9 @@ err_del:
 err:
 	kobject_put(scx_root_kobj);
 	scx_root_kobj = NULL;
-	if (scx_exit_info) {
-		free_exit_info(scx_exit_info);
-		scx_exit_info = NULL;
+	if (curr_sched->scx_exit_info) {
+		free_exit_info(curr_sched->scx_exit_info);
+		curr_sched->scx_exit_info = NULL;
 	}
 err_unlock:
 	mutex_unlock(&scx_ops_enable_mutex);
@@ -5382,7 +5426,7 @@ err_disable:
 	 * init completion.
 	 */
 	scx_ops_error("scx_ops_enable() failed (%d)", ret);
-	kthread_flush_work(&scx_ops_disable_work);
+	kthread_flush_work(&curr_sched->scx_ops_disable_work);
 	return 0;
 }
 
@@ -5595,7 +5639,7 @@ static int bpf_scx_reg(void *kdata, struct bpf_link *link)
 static void bpf_scx_unreg(void *kdata, struct bpf_link *link)
 {
 	scx_ops_disable(SCX_EXIT_UNREG);
-	kthread_flush_work(&scx_ops_disable_work);
+	kthread_flush_work(&curr_sched->scx_ops_disable_work);
 }
 
 static int bpf_scx_init(struct btf *btf)
@@ -5976,7 +6020,6 @@ void __init init_sched_ext_class(void)
 
 	register_sysrq_key('S', &sysrq_sched_ext_reset_op);
 	register_sysrq_key('D', &sysrq_sched_ext_dump_op);
-	INIT_DELAYED_WORK(&scx_watchdog_work, scx_watchdog_workfn);
 }
 
 
