@@ -880,13 +880,13 @@ enum scx_ops_state {
 #define SCX_OPSS_STATE_MASK	((1LU << SCX_OPSS_QSEQ_SHIFT) - 1)
 #define SCX_OPSS_QSEQ_MASK	(~SCX_OPSS_STATE_MASK)
 
-/* maximum number of schedulers (temporarily hard coded) */
-// #define MAX_SCHED		4
+/* maximum number of schedulers' priority (temporarily hard coded) */
+#define MAX_SCHED_PRIO		4
 
 struct scx_scheduler {
 	// u8			scx_sched_idx;
 	/* root task group for this scheduler */
-	// struct task_group	*root_tsk_grp;
+	struct task_group	*root_tsk_grp;
 	struct sched_ext_ops	scx_ops;
 	atomic_t		scx_exit_kind;
 	struct scx_exit_info	*scx_exit_info;
@@ -1458,6 +1458,11 @@ static struct task_struct *scx_task_iter_next(struct scx_task_iter *iter)
 		if (&pos->tasks_node == &scx_tasks)
 			return NULL;
 		if (!(pos->flags & SCX_TASK_CURSOR)) {
+			/*
+			 * Because list_for_each_entry needs a head,
+			 * cursor is inserted after pos->tasks_node 
+			 * as a fake head for next iteration.
+			 */
 			list_move(cursor, &pos->tasks_node);
 			return container_of(pos, struct task_struct, scx);
 		}
@@ -3885,6 +3890,12 @@ int scx_tg_online(struct task_group *tg)
 		tg->scx_flags |= SCX_TG_ONLINE;
 	}
 
+	/*
+	 * Temporarily set task group's scheduler into curr_sched 
+	 * TODO: try to input task_group's scheduler
+	 */
+	tg->sched = curr_sched;
+
 	percpu_up_read(&scx_cgroup_rwsem);
 	return ret;
 }
@@ -5100,6 +5111,8 @@ static int scx_sched_init(struct scx_scheduler **sched)
 		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
 		*cpu_sched = *sched;
 	}
+	/* temporarily set as root_task_group */
+	(*sched)->root_tsk_grp = &root_task_group;
 	(*sched)->scx_ops_enable_state_var = (atomic_t)ATOMIC_INIT(SCX_OPS_DISABLED); 
 	(*sched)->scx_watchdog_timestamp = INITIAL_JIFFIES;
 	(*sched)->scx_exit_kind = (atomic_t)ATOMIC_INIT(SCX_EXIT_DONE);
@@ -5334,6 +5347,11 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 
 		scx_set_task_state(p, SCX_TASK_READY);
 
+		/*
+		 * put_task_struct decrease the ref-count of a task_struct,
+		 * when this ref-count is 0, this task_struct will be freed.
+		 * Coupled with get_task_struct/tryget_task_struct.
+		 */
 		put_task_struct(p);
 		scx_task_iter_relock(&sti);
 	}

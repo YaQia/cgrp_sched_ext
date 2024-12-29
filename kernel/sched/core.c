@@ -9020,6 +9020,10 @@ static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
 	guard(rcu)();
 	cpu_util_update_eff(css);
 #endif
+	/*
+	 * TODO: input css scheduler value handled here. 
+	 * Should use a BPF obj file as stdin.
+	 */
 
 	return 0;
 }
