@@ -883,18 +883,31 @@ enum scx_ops_state {
 /* maximum number of schedulers' priority (temporarily hard coded) */
 #define MAX_SCHED_PRIO		4
 
+/* idle tracking */
+#ifdef CONFIG_SMP
+#ifdef CONFIG_CPUMASK_OFFSTACK
+#define CL_ALIGNED_IF_ONSTACK
+#else
+#define CL_ALIGNED_IF_ONSTACK __cacheline_aligned_in_smp
+#endif
+
+/* This mask can be globally used. */
+static struct {
+	cpumask_var_t cpu;
+	cpumask_var_t smt;
+} idle_masks CL_ALIGNED_IF_ONSTACK;
+
+#endif	/* CONFIG_SMP */
+
 struct scx_scheduler {
 	// u8			scx_sched_idx;
 	/* root task group for this scheduler */
 	struct task_group	*root_tsk_grp;
 	struct sched_ext_ops	scx_ops;
+	cpumask_var_t		avail_masks CL_ALIGNED_IF_ONSTACK;
 	atomic_t		scx_exit_kind;
 	struct scx_exit_info	*scx_exit_info;
 	atomic_t		scx_ops_enable_state_var;
-	bool			scx_ops_enq_last:1;
-	bool			scx_ops_enq_exiting:1;
-	bool			scx_ops_cpu_preempt:1;
-	bool			scx_builtin_idle_enabled:1;
 
 	/* use bitmap to reduce memory consumption */
 	DECLARE_BITMAP(scx_has_op, SCX_OPI_END);
@@ -930,6 +943,10 @@ struct scx_scheduler {
 	/* local dsqs */
 	struct rhashtable dsq_hash;
 
+	bool			scx_ops_enq_last:1;
+	bool			scx_ops_enq_exiting:1;
+	bool			scx_ops_cpu_preempt:1;
+	bool			scx_builtin_idle_enabled:1;
 } *root;
 
 static DEFINE_PER_CPU(struct scx_scheduler *, _curr_sched);
@@ -985,22 +1002,6 @@ static atomic_long_t scx_hotplug_seq = ATOMIC_LONG_INIT(0);
  * scheduler has ever been used in the system.
  */
 static atomic_long_t scx_enable_seq = ATOMIC_LONG_INIT(0);
-
-/* idle tracking */
-#ifdef CONFIG_SMP
-#ifdef CONFIG_CPUMASK_OFFSTACK
-#define CL_ALIGNED_IF_ONSTACK
-#else
-#define CL_ALIGNED_IF_ONSTACK __cacheline_aligned_in_smp
-#endif
-
-/* This mask can be globally used. */
-static struct {
-	cpumask_var_t cpu;
-	cpumask_var_t smt;
-} idle_masks CL_ALIGNED_IF_ONSTACK;
-
-#endif	/* CONFIG_SMP */
 
 /* for %SCX_KICK_WAIT */
 static unsigned long __percpu *scx_kick_cpus_pnt_seqs;
@@ -1588,12 +1589,13 @@ static void wait_ops_state(struct task_struct *p, unsigned long opss)
  * @where: extra information reported on error
  *
  * @cpu is a cpu number which came from the BPF scheduler and can be any value.
- * Verify that it is in range and one of the possible cpus. If invalid, trigger
- * an ops error.
+ * Verify that it is in range and one of the available cpus. If invalid, 
+ * trigger an ops error.
  */
 static bool ops_cpu_valid(s32 cpu, const char *where)
 {
-	if (likely(cpu >= 0 && cpu < nr_cpu_ids && cpu_possible(cpu))) {
+	if (likely(cpu >= 0 && cpu < nr_cpu_ids && 
+		   cpumask_test_cpu(cpu, curr_sched->avail_masks))) {
 		return true;
 	} else {
 		scx_ops_error("invalid CPU %d%s%s", cpu,
@@ -3217,10 +3219,18 @@ static s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
 	 * the local DSQ of the waker could have tasks piled up on it even if
 	 * there is an idle core elsewhere on the system.
 	 */
+	cpumask_var_t avail_idle_mask_cpu, avail_idle_mask_smt;
+	BUG_ON(!alloc_cpumask_var(&avail_idle_mask_cpu, GFP_KERNEL));
+	BUG_ON(!alloc_cpumask_var(&avail_idle_mask_smt, GFP_KERNEL));
+	cpumask_and(avail_idle_mask_cpu, idle_masks.cpu, 
+		    curr_sched->avail_masks);
+	cpumask_and(avail_idle_mask_smt, idle_masks.smt, 
+		    curr_sched->avail_masks);
 	cpu = smp_processor_id();
 	if ((wake_flags & SCX_WAKE_SYNC) &&
-	    !cpumask_empty(idle_masks.cpu) && !(current->flags & PF_EXITING) &&
-	    cpu_rq(cpu)->scx.local_dsq.nr == 0) {
+	    !cpumask_empty(avail_idle_mask_cpu) 
+	    && !(current->flags & PF_EXITING)
+	    && cpu_rq(cpu)->scx.local_dsq.nr == 0) {
 		if (cpumask_test_cpu(cpu, p->cpus_ptr))
 			goto cpu_found;
 	}
@@ -3230,7 +3240,7 @@ static s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
 	 * partially idle @prev_cpu.
 	 */
 	if (sched_smt_active()) {
-		if (cpumask_test_cpu(prev_cpu, idle_masks.smt) &&
+		if (cpumask_test_cpu(prev_cpu, avail_idle_mask_smt) &&
 		    test_and_clear_cpu_idle(prev_cpu)) {
 			cpu = prev_cpu;
 			goto cpu_found;
@@ -3241,7 +3251,8 @@ static s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
 			goto cpu_found;
 	}
 
-	if (test_and_clear_cpu_idle(prev_cpu)) {
+	if (cpumask_test_cpu(prev_cpu, curr_sched->avail_masks) && 
+	    test_and_clear_cpu_idle(prev_cpu)) {
 		cpu = prev_cpu;
 		goto cpu_found;
 	}
@@ -3275,8 +3286,7 @@ static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flag
 	if (unlikely(wake_flags & WF_EXEC))
 		return prev_cpu;
 
-	if (SCX_HAS_OP(select_cpu) 
-	    && !scx_rq_bypassing(task_rq(p))) {
+	if (SCX_HAS_OP(select_cpu) && !scx_rq_bypassing(task_rq(p))) {
 		s32 cpu;
 		struct task_struct **ddsp_taskp;
 
@@ -3313,6 +3323,9 @@ static void set_cpus_allowed_scx(struct task_struct *p,
 				 struct affinity_context *ac)
 {
 	set_cpus_allowed_common(p, ac);
+
+	/* let p->cpus_mask_mask conforms the cpumask of curr_sched */
+	cpumask_and(&p->cpus_mask, &p->cpus_mask, curr_sched->avail_masks);
 
 	/*
 	 * The effective cpumask is stored in @p->cpus_ptr which may temporarily
@@ -5154,6 +5167,13 @@ static int scx_sched_init(struct scx_scheduler **sched)
 
 		(*sched)->global_dsqs = dsqs;
 	}
+
+#ifdef CONFIG_SMP
+	BUG_ON(!alloc_cpumask_var(&(*sched)->avail_masks, GFP_KERNEL));
+
+	/* TODO: We need input cpumask as scheduler's CPU range. */
+	cpumask_copy((*sched)->avail_masks, cpu_online_mask);
+#endif
 	for_each_possible_cpu(i) {
 		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
 		*cpu_sched = *sched;
