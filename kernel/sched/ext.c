@@ -917,6 +917,19 @@ struct scx_scheduler {
 	struct delayed_work	scx_watchdog_work;
 	struct kthread_work	scx_ops_disable_work;
 	struct irq_work		scx_ops_error_irq_work;
+
+	/*
+	 * Dispatch queues.
+	 *
+	 * The global DSQ (%SCX_DSQ_GLOBAL) is split per-node for scalability. This is
+	 * to avoid live-locking in bypass mode where all tasks are dispatched to
+	 * %SCX_DSQ_GLOBAL and all CPUs consume from it. If per-node split isn't
+	 * sufficient, it can be further split.
+	 */
+	struct scx_dispatch_q **global_dsqs;
+	/* local dsqs */
+	struct rhashtable dsq_hash;
+
 } *root;
 
 static DEFINE_PER_CPU(struct scx_scheduler *, _curr_sched);
@@ -981,6 +994,7 @@ static atomic_long_t scx_enable_seq = ATOMIC_LONG_INIT(0);
 #define CL_ALIGNED_IF_ONSTACK __cacheline_aligned_in_smp
 #endif
 
+/* This mask can be globally used. */
 static struct {
 	cpumask_var_t cpu;
 	cpumask_var_t smt;
@@ -1008,7 +1022,7 @@ static DEFINE_PER_CPU(struct task_struct *, direct_dispatch_task);
  * %SCX_DSQ_GLOBAL and all CPUs consume from it. If per-node split isn't
  * sufficient, it can be further split.
  */
-static struct scx_dispatch_q **global_dsqs;
+/*static struct scx_dispatch_q **global_dsqs;*/
 
 static const struct rhashtable_params dsq_hash_params = {
 	.key_len		= 8,
@@ -1016,7 +1030,7 @@ static const struct rhashtable_params dsq_hash_params = {
 	.head_offset		= offsetof(struct scx_dispatch_q, hash_node),
 };
 
-static struct rhashtable dsq_hash;
+/*static struct rhashtable dsq_hash;*/
 static LLIST_HEAD(dsqs_to_free);
 
 /* dispatch buf */
@@ -1113,12 +1127,13 @@ static bool u32_before(u32 a, u32 b)
 
 static struct scx_dispatch_q *find_global_dsq(struct task_struct *p)
 {
-	return global_dsqs[cpu_to_node(task_cpu(p))];
+	return curr_sched->global_dsqs[cpu_to_node(task_cpu(p))];
 }
 
 static struct scx_dispatch_q *find_user_dsq(u64 dsq_id)
 {
-	return rhashtable_lookup_fast(&dsq_hash, &dsq_id, dsq_hash_params);
+	return rhashtable_lookup_fast(&curr_sched->dsq_hash,
+				      &dsq_id, dsq_hash_params);
 }
 
 /*
@@ -2517,7 +2532,7 @@ static bool consume_global_dsq(struct rq *rq)
 {
 	int node = cpu_to_node(cpu_of(rq));
 
-	return consume_dispatch_q(rq, global_dsqs[node]);
+	return consume_dispatch_q(rq, curr_sched->global_dsqs[node]);
 }
 
 /**
@@ -4129,7 +4144,7 @@ static struct scx_dispatch_q *create_dsq(u64 dsq_id, int node)
 
 	init_dsq(dsq, dsq_id);
 
-	ret = rhashtable_insert_fast(&dsq_hash, &dsq->hash_node,
+	ret = rhashtable_insert_fast(&curr_sched->dsq_hash, &dsq->hash_node,
 				     dsq_hash_params);
 	if (ret) {
 		kfree(dsq);
@@ -4168,7 +4183,8 @@ static void destroy_dsq(u64 dsq_id)
 		goto out_unlock_dsq;
 	}
 
-	if (rhashtable_remove_fast(&dsq_hash, &dsq->hash_node, dsq_hash_params))
+	if (rhashtable_remove_fast(&curr_sched->dsq_hash, &dsq->hash_node,
+				   dsq_hash_params))
 		goto out_unlock_dsq;
 
 	/*
@@ -4682,7 +4698,7 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 
 	memset(&sched->scx_ops, 0, sizeof(sched->scx_ops));
 
-	rhashtable_walk_enter(&dsq_hash, &rht_iter);
+	rhashtable_walk_enter(&sched->dsq_hash, &rht_iter);
 	do {
 		rhashtable_walk_start(&rht_iter);
 
@@ -5101,11 +5117,42 @@ static int validate_ops(const struct sched_ext_ops *ops)
 
 static int scx_sched_init(struct scx_scheduler **sched)
 {
-	int ret = 0, i;
+	int ret = 0, i, node;
+
 	*sched = kzalloc(sizeof(struct scx_scheduler), GFP_KERNEL);
 	if (!*sched) {
 		ret = -ENOMEM;
 		goto err;
+	}
+
+	BUG_ON(rhashtable_init(&(*sched)->dsq_hash, &dsq_hash_params));
+
+	if (!(*sched)->global_dsqs) {
+		struct scx_dispatch_q **dsqs;
+
+		dsqs = kcalloc(nr_node_ids, sizeof(dsqs[0]), GFP_KERNEL);
+		if (!dsqs) {
+			ret = -ENOMEM;
+			goto err;
+		}
+
+		for_each_node_state(node, N_POSSIBLE) {
+			struct scx_dispatch_q *dsq;
+
+			dsq = kzalloc_node(sizeof(*dsq), GFP_KERNEL, node);
+			if (!dsq) {
+				for_each_node_state(node, N_POSSIBLE)
+					kfree(dsqs[node]);
+				kfree(dsqs);
+				ret = -ENOMEM;
+				goto err;
+			}
+
+			init_dsq(dsq, SCX_DSQ_GLOBAL);
+			dsqs[node] = dsq;
+		}
+
+		(*sched)->global_dsqs = dsqs;
 	}
 	for_each_possible_cpu(i) {
 		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
@@ -5130,7 +5177,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	struct scx_task_iter sti;
 	struct task_struct *p;
 	unsigned long timeout;
-	int i, cpu, node, ret;
+	int i, cpu, ret;
 
 	if (!cpumask_equal(housekeeping_cpumask(HK_TYPE_DOMAIN),
 			   cpu_possible_mask)) {
@@ -5147,34 +5194,6 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 			ret = -ENOMEM;
 			goto err_unlock;
 		}
-	}
-
-	if (!global_dsqs) {
-		struct scx_dispatch_q **dsqs;
-
-		dsqs = kcalloc(nr_node_ids, sizeof(dsqs[0]), GFP_KERNEL);
-		if (!dsqs) {
-			ret = -ENOMEM;
-			goto err_unlock;
-		}
-
-		for_each_node_state(node, N_POSSIBLE) {
-			struct scx_dispatch_q *dsq;
-
-			dsq = kzalloc_node(sizeof(*dsq), GFP_KERNEL, node);
-			if (!dsq) {
-				for_each_node_state(node, N_POSSIBLE)
-					kfree(dsqs[node]);
-				kfree(dsqs);
-				ret = -ENOMEM;
-				goto err_unlock;
-			}
-
-			init_dsq(dsq, SCX_DSQ_GLOBAL);
-			dsqs[node] = dsq;
-		}
-
-		global_dsqs = dsqs;
 	}
 
 	if (!root) {
@@ -6008,7 +6027,6 @@ void __init init_sched_ext_class(void)
 	WRITE_ONCE(v, SCX_ENQ_WAKEUP | SCX_DEQ_SLEEP | SCX_KICK_PREEMPT |
 		   SCX_TG_ONLINE);
 
-	BUG_ON(rhashtable_init(&dsq_hash, &dsq_hash_params));
 #ifdef CONFIG_SMP
 	BUG_ON(!alloc_cpumask_var(&idle_masks.cpu, GFP_KERNEL));
 	BUG_ON(!alloc_cpumask_var(&idle_masks.smt, GFP_KERNEL));
