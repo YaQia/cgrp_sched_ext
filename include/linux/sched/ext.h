@@ -156,8 +156,8 @@ struct sched_ext_entity {
 #ifdef CONFIG_SCHED_CORE
 	u64			core_sched_at;	/* see scx_prio_less() */
 #endif
-	u64			ddsp_dsq_id;
-	u64			ddsp_enq_flags;
+	u64			ddsp_dsq_id;	/* direct dispatch dsq id */
+	u64			ddsp_enq_flags;	/* direct dispatch enq flag */
 
 	/* BPF scheduler modifiable fields */
 

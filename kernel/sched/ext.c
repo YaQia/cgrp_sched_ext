@@ -958,6 +958,12 @@ static __always_inline struct scx_scheduler *get_curr_sched(void)
 
 #define curr_sched get_curr_sched()
 
+static struct scx_sched_prio {
+	struct list_head node;
+	struct scx_scheduler *sched_ptr;
+	bool has_task;
+} root_prio;
+
 /*
  * During exit, a task may schedule after losing its PIDs. When disabling the
  * BPF scheduler, we need to be able to iterate tasks in every state to
@@ -1161,7 +1167,7 @@ static void scx_kf_disallow(u32 mask)
 	current->scx.kf_mask &= ~mask;
 }
 
-#define SCX_SCHED_CALL_OP(sched, mask, op, args...)						\
+#define SCX_SCHED_CALL_OP(sched, mask, op, args...)				\
 do {										\
 	if (mask) {								\
 		scx_kf_allow(mask);						\
@@ -1171,6 +1177,19 @@ do {										\
 		sched->scx_ops.op(args);					\
 	}									\
 } while (0)
+
+#define SCX_SCHED_CALL_OP_RET(sched, mask, op, args...)				\
+({										\
+	__typeof__(sched->scx_ops.op(args)) __ret;				\
+	if (mask) {								\
+		scx_kf_allow(mask);						\
+		__ret = sched->scx_ops.op(args);				\
+		scx_kf_disallow(mask);						\
+	} else {								\
+		__ret = sched->scx_ops.op(args);				\
+	}									\
+	__ret;									\
+})
 
 #define SCX_CALL_OP(mask, op, args...)						\
 do {										\
@@ -1927,7 +1946,7 @@ static void dispatch_dequeue(struct rq *rq, struct task_struct *p)
 	/*
 	 * Now that we hold @dsq->lock, @p->holding_cpu and @p->scx.dsq_* can't
 	 * change underneath us.
-	*/
+	 */
 	if (p->scx.holding_cpu < 0) {
 		/* @p must still be on @dsq, dequeue */
 		task_unlink_from_dsq(p, dsq);
@@ -4586,6 +4605,7 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	struct task_struct *p;
 	struct rhashtable_iter rht_iter;
 	struct scx_dispatch_q *dsq;
+	struct scx_sched_prio *sched_prio_pos;
 	int i, kind;
 
 	kind = atomic_read(&sched->scx_exit_kind);
@@ -4669,6 +4689,19 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	}
 	scx_task_iter_stop(&sti);
 	percpu_up_write(&scx_fork_rwsem);
+
+	for_each_cpu(i, sched->avail_masks) {
+		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
+		if (*cpu_sched == sched) {
+			list_for_each_entry(sched_prio_pos, &root_prio.node, node) {
+				if (sched_prio_pos->sched_ptr != sched &&
+				    sched_prio_pos->has_task) {
+					*cpu_sched = sched_prio_pos->sched_ptr;
+					break;
+				}
+			}
+		}
+	}
 
 	/* no task is on scx, turn off all the switches and flush in-progress calls */
 	static_branch_disable(&__scx_ops_enabled);
@@ -5138,6 +5171,18 @@ static int scx_sched_init(struct scx_scheduler **sched)
 		goto err;
 	}
 
+	/* Add scheduler into priority list */
+	struct scx_sched_prio *sched_prio = kzalloc(sizeof(struct scx_sched_prio),
+						    GFP_KERNEL);
+	struct scx_sched_prio *sched_prio_pos;
+	if (!sched_prio) {
+		ret = -ENOMEM;
+		goto err;
+	}
+	sched_prio->sched_ptr = *sched;
+	/* TODO: Temporarily use FIFO to handle multiple schedulers */
+	list_add_tail(&sched_prio->node, &root_prio.node);
+
 	BUG_ON(rhashtable_init(&(*sched)->dsq_hash, &dsq_hash_params));
 
 	if (!(*sched)->global_dsqs) {
@@ -5174,12 +5219,23 @@ static int scx_sched_init(struct scx_scheduler **sched)
 	/* TODO: We need input cpumask as scheduler's CPU range. */
 	cpumask_copy((*sched)->avail_masks, cpu_online_mask);
 #endif
-	for_each_possible_cpu(i) {
-		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
-		*cpu_sched = *sched;
-	}
-	/* temporarily set as root_task_group */
+
+	/* TODO: temporarily set as root_task_group */
 	(*sched)->root_tsk_grp = &root_task_group;
+
+	for_each_cpu(i, (*sched)->avail_masks) {
+		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
+		if (!sched_prio->has_task && (*sched)->root_tsk_grp->se[i]) {
+			sched_prio->has_task = true;
+		}
+		list_for_each_entry(sched_prio_pos, &root_prio.node, node) {
+			if (sched_prio_pos->has_task) {
+				*cpu_sched = sched_prio_pos->sched_ptr;
+				break;
+			}
+		}
+	}
+
 	(*sched)->scx_ops_enable_state_var = (atomic_t)ATOMIC_INIT(SCX_OPS_DISABLED); 
 	(*sched)->scx_watchdog_timestamp = INITIAL_JIFFIES;
 	(*sched)->scx_exit_kind = (atomic_t)ATOMIC_INIT(SCX_EXIT_DONE);
@@ -5196,6 +5252,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 {
 	struct scx_task_iter sti;
 	struct task_struct *p;
+	struct scx_scheduler *sched;
 	unsigned long timeout;
 	int i, cpu, ret;
 
@@ -5207,6 +5264,10 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 
 	mutex_lock(&scx_ops_enable_mutex);
 
+	if ((ret = scx_sched_init(&sched))) {
+		goto err_unlock;
+	}
+
 	if (!scx_ops_helper) {
 		WRITE_ONCE(scx_ops_helper,
 			   scx_create_rt_helper("sched_ext_ops_helper"));
@@ -5216,10 +5277,16 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 		}
 	}
 
+	/* Temporarily change the curr_sched into this scheduler */
+#define switch_curr_sched()					\
+	if (curr_sched != sched) {				\
+		sched = this_cpu_xchg(_curr_sched, sched);	\
+	}
+
+	switch_curr_sched();
+
 	if (!root) {
-		if ((ret = scx_sched_init(&root))) {
-			goto err_unlock;
-		}
+		root = curr_sched;
 	}
 
 	if (scx_ops_enable_state() != SCX_OPS_DISABLED) {
@@ -5452,6 +5519,9 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 
 	atomic_long_inc(&scx_enable_seq);
 
+	/* Change curr_sched back */
+	switch_curr_sched();
+
 	return 0;
 
 err_del:
@@ -5464,6 +5534,7 @@ err:
 		curr_sched->scx_exit_info = NULL;
 	}
 err_unlock:
+	switch_curr_sched();
 	mutex_unlock(&scx_ops_enable_mutex);
 	return ret;
 
@@ -5472,6 +5543,7 @@ err_disable_unlock_all:
 	percpu_up_write(&scx_fork_rwsem);
 	scx_ops_bypass(false);
 err_disable:
+	switch_curr_sched();
 	mutex_unlock(&scx_ops_enable_mutex);
 	/*
 	 * Returning an error code here would not pass all the error information
@@ -5484,6 +5556,7 @@ err_disable:
 	 */
 	scx_ops_error("scx_ops_enable() failed (%d)", ret);
 	kthread_flush_work(&curr_sched->scx_ops_disable_work);
+#undef switch_curr_sched
 	return 0;
 }
 
