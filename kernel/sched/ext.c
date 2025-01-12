@@ -7,10 +7,7 @@
  * Copyright (c) 2022 David Vernet <dvernet@meta.com>
  */
 
-#include "linux/container_of.h"
 #include "linux/cpumask.h"
-#include "linux/list.h"
-#include "linux/percpu-defs.h"
 #include <linux/sched/clock.h>
 #include <linux/sched/cputime.h>
 #include <linux/sched/hotplug.h>
@@ -42,7 +39,8 @@
 #include "autogroup.h"
 // #include "stats.h"
 #include "pelt.h"
-
+#include "../cgroup/cpuset-internal.h"
+// NOLINTBEGIN(bugprone-sizeof-expression)
 #define SCX_OP_IDX(op)		(offsetof(struct sched_ext_ops, op) / sizeof(void (*)(void)))
 
 enum scx_consts {
@@ -675,6 +673,11 @@ struct sched_ext_ops {
 	void (*exit)(struct scx_exit_info *info);
 
 	/**
+	 * root_group - root task group for this scheduler
+	 */
+	struct task_group *root_group;
+
+	/**
 	 * dispatch_max_batch - Max nr of tasks that dispatch() can dispatch
 	 */
 	u32 dispatch_max_batch;
@@ -951,7 +954,7 @@ struct scx_scheduler {
 	bool			scx_ops_enq_exiting:1;
 	bool			scx_ops_cpu_preempt:1;
 	bool			scx_builtin_idle_enabled:1;
-};
+} dummy_sched;
 
 static DEFINE_PER_CPU(struct scx_scheduler *, _curr_sched);
 
@@ -968,15 +971,15 @@ do {								\
 	tmp_sched = this_cpu_xchg(_curr_sched, tmp_sched);	\
 } while(0)
 
-struct scx_sched_prio {
-	struct list_head prio_node;
-	struct scx_scheduler sched;
-	size_t task_num;
-} dummy_prio;
-
-struct scx_sched_prio_list {
-	struct list_head prio_list;
-} sched_prio_head;
+// struct scx_sched_prio {
+// 	struct list_head prio_node;
+// 	struct scx_scheduler sched;
+// 	size_t task_num;
+// } dummy_prio;
+//
+// struct scx_sched_prio_list {
+// 	struct list_head prio_list;
+// } sched_prio_head;
 
 /*
  * During exit, a task may schedule after losing its PIDs. When disabling the
@@ -2219,26 +2222,20 @@ static void clr_task_runnable(struct task_struct *p, bool reset_runnable_at)
 		p->scx.flags |= SCX_TASK_RESET_RUNNABLE_AT;
 }
 
-static void change_curr_sched(struct task_struct *p)
-{
-	struct task_group *ptg = p->sched_task_group;
-	if (ptg->sched != curr_sched) {
-		struct scx_sched_prio *sched_prio_pos = 
-			container_of(ptg->sched, struct scx_sched_prio, sched);
-		struct scx_scheduler **sched = this_cpu_ptr(&_curr_sched);
-		*sched = ptg->sched;
-
-		list_for_each_entry(sched_prio_pos, &sched_prio_head.prio_list,
-				    prio_node) {
-			// if (&sched_prio_pos->sched != ptg->sched &&
-			//     sched_prio_pos->has_task) {
-			// 	*cpu_sched = &sched_prio_pos->sched;
-			// 	break;
-			// }
-
-		}
-	}
-}
+// static void change_curr_sched(struct task_struct *p)
+// {
+// 	struct task_group *ptg = p->sched_task_group;
+// 	if (ptg->sched != curr_sched) {
+// 		// struct scx_sched_prio *sched_prio_pos = 
+// 		// 	container_of(ptg->sched, struct scx_sched_prio, sched);
+// 		struct scx_scheduler **sched = this_cpu_ptr(&_curr_sched);
+// 		*sched = ptg->sched;
+//
+// 		// list_for_each_entry(sched_prio_pos, &sched_prio_head.prio_list,
+// 		// 		    prio_node) {
+// 		// }
+// 	}
+// }
 
 static void enqueue_task_scx(struct rq *rq, struct task_struct *p, int enq_flags)
 {
@@ -3702,8 +3699,8 @@ static void scx_ops_enable_task(struct task_struct *p)
 	lockdep_assert_rq_held(task_rq(p));
 
 	struct scx_scheduler *sched = task_group(p)->sched;
-	struct scx_sched_prio *sched_prio = container_of
-			(sched, struct scx_sched_prio, sched);
+	// struct scx_sched_prio *sched_prio = container_of
+	// 		(sched, struct scx_sched_prio, sched);
 
 	/*
 	 * If the scheduler has tasks, then push it on the head.
@@ -3711,16 +3708,16 @@ static void scx_ops_enable_task(struct task_struct *p)
 	 * Newer inserted schedulers will have higher priority.
 	 * And those schedulers with no tasks will be in low priority.
 	 */
-	if (unlikely(!sched_prio->task_num)) {
-		list_del(&sched_prio->prio_node);
-		list_add(&sched_prio->prio_node, &sched_prio_head.prio_list);
-	}
+	// if (unlikely(!sched_prio->task_num)) {
+	// 	list_del(&sched_prio->prio_node);
+	// 	list_add(&sched_prio->prio_node, &sched_prio_head.prio_list);
+	// }
 
 	/*
 	 * We don't need to add task_num in scx_ops_init_task,
 	 * because scx_ops_init_task is only setting basics for tasks.
 	 */
-	sched_prio->task_num += 1;
+	// sched_prio->task_num += 1;
 
 	/*
 	 * Set the weight before calling ops.enable() so that the scheduler
@@ -3748,16 +3745,16 @@ static void scx_ops_disable_task(struct task_struct *p)
 	WARN_ON_ONCE(scx_get_task_state(p) != SCX_TASK_ENABLED);
 
 	struct scx_scheduler *sched = task_group(p)->sched;
-	struct scx_sched_prio *sched_prio = container_of
-			(sched, struct scx_sched_prio, sched);
-	sched_prio->task_num -= 1;
+	// struct scx_sched_prio *sched_prio = container_of
+	// 		(sched, struct scx_sched_prio, sched);
+	// sched_prio->task_num -= 1;
 	/*
 	 * No task scheduler has lowest priority.
 	 */
-	if (unlikely(!sched_prio->task_num)) {
-		list_del(&sched_prio->prio_node);
-		list_add_tail(&sched_prio->prio_node, &sched_prio_head.prio_list);
-	}
+	// if (unlikely(!sched_prio->task_num)) {
+	// 	list_del(&sched_prio->prio_node);
+	// 	list_add_tail(&sched_prio->prio_node, &sched_prio_head.prio_list);
+	// }
 
 	if (SCX_SCHED_HAS_OP(sched, disable))
 		SCX_SCHED_CALL_OP(sched, SCX_KF_REST, disable, p);
@@ -4686,13 +4683,13 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 {
 	struct scx_scheduler *sched = 
 		container_of(work, struct scx_scheduler, scx_ops_disable_work);
-	struct scx_sched_prio *prio = container_of(sched, struct scx_sched_prio, sched);
+	// struct scx_sched_prio *prio = container_of(sched, struct scx_sched_prio, sched);
 	struct scx_exit_info *ei = sched->scx_exit_info;
 	struct scx_task_iter sti;
 	struct task_struct *p;
 	struct rhashtable_iter rht_iter;
 	struct scx_dispatch_q *dsq;
-	struct scx_sched_prio *sched_prio_pos;
+	// struct scx_sched_prio *sched_prio_pos;
 	int i, kind;
 
 	kind = atomic_read(&sched->scx_exit_kind);
@@ -4779,27 +4776,28 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 
 	for_each_cpu(i, sched->avail_masks) {
 		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
-		bool need_change = false, deleted = false;
-		if (*cpu_sched == sched) {
-			need_change = true;
-		}
-		struct scx_sched_prio *next_pos;
-		list_for_each_entry_safe(sched_prio_pos, next_pos, 
-					 &sched_prio_head.prio_list, prio_node) {
-			if (need_change && &sched_prio_pos->sched != sched &&
-					sched_prio_pos->task_num) {
-				*cpu_sched = &sched_prio_pos->sched;
-				need_change = false;
-				if (deleted)
-					break;
-			} else if (&sched_prio_pos->sched == sched) {
-				list_del(&sched_prio_pos->prio_node);
-				deleted = true;
-				if (!need_change) {
-					break;
-				}
-			}
-		}
+		*cpu_sched = &dummy_sched;
+		// bool need_change = false, deleted = false;
+		// if (*cpu_sched == sched) {
+		// 	need_change = true;
+		// }
+		// struct scx_sched_prio *next_pos;
+		// list_for_each_entry_safe(sched_prio_pos, next_pos, 
+		// 			 &sched_prio_head.prio_list, prio_node) {
+		// 	if (need_change && &sched_prio_pos->sched != sched &&
+		// 			sched_prio_pos->task_num) {
+		// 		*cpu_sched = &sched_prio_pos->sched;
+		// 		need_change = false;
+		// 		if (deleted)
+		// 			break;
+		// 	} else if (&sched_prio_pos->sched == sched) {
+		// 		list_del(&sched_prio_pos->prio_node);
+		// 		deleted = true;
+		// 		if (!need_change) {
+		// 			break;
+		// 		}
+		// 	}
+		// }
 	}
 
 	/* no task is on scx, turn off all the switches and flush in-progress calls */
@@ -4861,7 +4859,7 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	free_exit_info(sched->scx_exit_info);
 	sched->scx_exit_info = NULL;
 
-	kfree(prio);
+	// kfree(prio);
 
 	mutex_unlock(&scx_ops_enable_mutex);
 
@@ -5262,28 +5260,43 @@ static int validate_ops(const struct sched_ext_ops *ops)
 	return 0;
 }
 
-static int scx_sched_init(struct scx_scheduler **sched)
+static int scx_sched_init(struct scx_scheduler **sched, struct task_group *root_grp)
 {
-	int ret = 0, node;
+	int ret = 0, node, i;
 
 	/* Add scheduler into priority list */
-	struct scx_sched_prio *sched_prio = kzalloc(sizeof(struct scx_sched_prio),
-						    GFP_KERNEL);
-	if (!sched_prio) {
+	// struct scx_sched_prio *sched_prio = kzalloc(sizeof(struct scx_sched_prio),
+	// 					    GFP_KERNEL);
+	// if (!sched_prio) {
+	// 	ret = -ENOMEM;
+	// 	goto err;
+	// }
+	// *sched = &sched_prio->sched;
+	*sched = kzalloc(sizeof(struct scx_scheduler), GFP_KERNEL);
+	if (!(*sched)) {
 		ret = -ENOMEM;
 		goto err;
 	}
-	*sched = &sched_prio->sched;
 	/* TODO: Temporarily use FIFO to handle multiple schedulers */
-	list_add_tail(&sched_prio->prio_node, &sched_prio_head.prio_list);
+	// list_add_tail(&sched_prio->prio_node, &sched_prio_head.prio_list);
 
 	BUG_ON(rhashtable_init(&(*sched)->dsq_hash, &dsq_hash_params));
 
 #ifdef CONFIG_SMP
 	BUG_ON(!alloc_cpumask_var(&(*sched)->avail_masks, GFP_KERNEL));
 
-	/* TODO: We need input cpumask as scheduler's CPU range. */
-	cpumask_copy((*sched)->avail_masks, cpu_online_mask);
+	struct cpuset *cs = css_cs(&root_grp->css);
+	cpumask_copy((*sched)->avail_masks, cs->effective_cpus);
+	for_each_cpu(i, (*sched)->avail_masks) {
+		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
+		if (*cpu_sched != &dummy_sched) {
+			free_cpumask_var((*sched)->avail_masks);
+			pr_err("sched_ext: Multiple schedulers in one core is not supported\n");
+			ret = -EINVAL;
+			goto err;
+		}
+		*cpu_sched = *sched;
+	}
 #endif
 
 	if (!(*sched)->global_dsqs) {
@@ -5322,8 +5335,7 @@ static int scx_sched_init(struct scx_scheduler **sched)
 		(*sched)->global_dsqs = dsqs;
 	}
 
-	/* TODO: temporarily set to root_task_group */
-	(*sched)->root_tsk_grp = &root_task_group;
+	(*sched)->root_tsk_grp = root_grp;
 	(*sched)->scx_ops_enable_state_var = (atomic_t)ATOMIC_INIT(SCX_OPS_DISABLED); 
 	(*sched)->scx_watchdog_timestamp = INITIAL_JIFFIES;
 	(*sched)->scx_exit_kind = (atomic_t)ATOMIC_INIT(SCX_EXIT_DONE);
@@ -5340,7 +5352,6 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	struct scx_task_iter sti;
 	struct task_struct *p;
 	struct scx_scheduler *sched, *tmp_sched;
-	struct scx_sched_prio *sched_prio_pos;
 	unsigned long timeout;
 	int i, cpu, ret;
 
@@ -5351,8 +5362,12 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	}
 
 	mutex_lock(&scx_ops_enable_mutex);
+	
+	if (!ops->root_group) {
+		ops->root_group = &root_task_group;
+	}
 
-	if ((ret = scx_sched_init(&sched))) {
+	if ((ret = scx_sched_init(&sched, ops->root_group))) {
 		goto err_unlock;
 	}
 
@@ -5367,16 +5382,18 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 
 	tmp_sched = sched;
 
-	switch_curr_sched(tmp_sched);
+	// switch_curr_sched(tmp_sched);
 
 	if (scx_ops_enable_state() != SCX_OPS_DISABLED) {
 		ret = -EBUSY;
+		switch_curr_sched(tmp_sched);
 		goto err_unlock;
 	}
 
 	scx_root_kobj = kzalloc(sizeof(*scx_root_kobj), GFP_KERNEL);
 	if (!scx_root_kobj) {
 		ret = -ENOMEM;
+		switch_curr_sched(tmp_sched);
 		goto err_unlock;
 	}
 
@@ -5593,18 +5610,18 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 		static_branch_enable(&__scx_switched_all);
 
 	/* Change curr_sched back */
-	switch_curr_sched(tmp_sched);
+	// switch_curr_sched(tmp_sched);
 
-	struct scx_sched_prio *curr_sched_prio = list_first_entry
-		(&sched_prio_head.prio_list, struct scx_sched_prio, prio_node);
-	struct scx_scheduler *new_curr_sched = &curr_sched_prio->sched;
+	// struct scx_sched_prio *curr_sched_prio = list_first_entry
+	// 	(&sched_prio_head.prio_list, struct scx_sched_prio, prio_node);
+	// struct scx_scheduler *new_curr_sched = &curr_sched_prio->sched;
 	/*
 	 * For each CPU allowed for this scheduler, reassign _curr_sched.
 	 */
-	for_each_cpu(i, new_curr_sched->avail_masks) {
-		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
-		*cpu_sched = new_curr_sched;
-	}
+	// for_each_cpu(i, new_curr_sched->avail_masks) {
+	// 	struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
+	// 	*cpu_sched = new_curr_sched;
+	// }
 
 	pr_info("sched_ext: BPF scheduler \"%s\" enabled%s\n",
 		sched->scx_ops.name, scx_switched_all() ? "" : " (partial)");
@@ -5624,8 +5641,8 @@ err:
 		free_exit_info(sched->scx_exit_info);
 		sched->scx_exit_info = NULL;
 	}
-err_unlock:
 	switch_curr_sched(tmp_sched);
+err_unlock:
 	mutex_unlock(&scx_ops_enable_mutex);
 	return ret;
 
@@ -7619,14 +7636,17 @@ static int __init scx_init(void)
 		return ret;
 	}
 
+	// list_add_tail(&dummy_prio.prio_node, &sched_prio_head.prio_list);
 	/*
 	 * Give the value of basic scheduler to i_sched
 	 */
 	for_each_possible_cpu(i) {
 		struct scx_scheduler **i_sched = per_cpu_ptr(&_curr_sched, i);
-		*i_sched = &dummy_prio.sched;
+		// *i_sched = &dummy_prio.sched;
+		*i_sched = &dummy_sched;
 	}
 
 	return 0;
 }
 __initcall(scx_init);
+// NOLINTEND(bugprone-sizeof-expression)
