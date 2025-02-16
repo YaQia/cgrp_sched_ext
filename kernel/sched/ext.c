@@ -7,38 +7,37 @@
  * Copyright (c) 2022 David Vernet <dvernet@meta.com>
  */
 
-#include "linux/cpumask.h"
-#include <linux/sched/clock.h>
-#include <linux/sched/cputime.h>
-#include <linux/sched/hotplug.h>
-#include <linux/sched/isolation.h>
-#include <linux/sched/posix-timers.h>
-#include <linux/sched/rt.h>
-
-#include <linux/cpuidle.h>
-#include <linux/jiffies.h>
-#include <linux/kobject.h>
-#include <linux/livepatch.h>
-#include <linux/pm.h>
-#include <linux/psi.h>
-#include <linux/rhashtable.h>
-#include <linux/seq_buf.h>
-#include <linux/seqlock_api.h>
-#include <linux/slab.h>
-#include <linux/suspend.h>
-#include <linux/tsacct_kern.h>
-#include <linux/vtime.h>
-#include <linux/sysrq.h>
-#include <linux/percpu-rwsem.h>
-
-#include <uapi/linux/sched/types.h>
-
-#include "sched.h"
-#include "smp.h"
-
-#include "autogroup.h"
-// #include "stats.h"
-#include "pelt.h"
+// #include <linux/sched/clock.h>
+// #include <linux/sched/cputime.h>
+// #include <linux/sched/hotplug.h>
+// #include <linux/sched/isolation.h>
+// #include <linux/sched/posix-timers.h>
+// #include <linux/sched/rt.h>
+//
+// #include <linux/cpuidle.h>
+// #include <linux/jiffies.h>
+// #include <linux/kobject.h>
+// #include <linux/livepatch.h>
+// #include <linux/pm.h>
+// #include <linux/psi.h>
+// #include <linux/rhashtable.h>
+// #include <linux/seq_buf.h>
+// #include <linux/seqlock_api.h>
+// #include <linux/slab.h>
+// #include <linux/suspend.h>
+// #include <linux/tsacct_kern.h>
+// #include <linux/vtime.h>
+// #include <linux/sysrq.h>
+// #include <linux/percpu-rwsem.h>
+//
+// #include <uapi/linux/sched/types.h>
+//
+// #include "sched.h"
+// #include "smp.h"
+//
+// #include "autogroup.h"
+// // #include "stats.h"
+// #include "pelt.h"
 #include "../cgroup/cpuset-internal.h"
 // NOLINTBEGIN(bugprone-sizeof-expression)
 #define SCX_OP_IDX(op)		(offsetof(struct sched_ext_ops, op) / sizeof(void (*)(void)))
@@ -4690,7 +4689,7 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	struct rhashtable_iter rht_iter;
 	struct scx_dispatch_q *dsq;
 	// struct scx_sched_prio *sched_prio_pos;
-	int i, kind;
+	int i, kind, node;
 
 	kind = atomic_read(&sched->scx_exit_kind);
 	while (true) {
@@ -4860,6 +4859,15 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	sched->scx_exit_info = NULL;
 
 	// kfree(prio);
+	
+	for_each_node_state(node, N_POSSIBLE) {
+		if (sched->global_dsqs[node]) {
+			kfree(sched->global_dsqs[node]);
+		}
+	}
+	kfree(sched->global_dsqs);
+	kfree(sched->avail_masks);
+	kfree(sched);
 
 	mutex_unlock(&scx_ops_enable_mutex);
 
