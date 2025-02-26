@@ -3967,6 +3967,9 @@ static bool cgroup_warned_missing_idle;
 
 static void scx_cgroup_warn_missing_weight(struct task_group *tg)
 {
+	// indicates that dummy_sched is not initialized, we are in the early init state.
+	if (!dummy_sched.avail_masks)
+		return;
 	if (scx_ops_enable_state() == SCX_OPS_DISABLED ||
 	    cgroup_warned_missing_weight)
 		return;
@@ -4003,7 +4006,7 @@ int scx_tg_online(struct task_group *tg)
 
 	scx_cgroup_warn_missing_weight(tg);
 
-	if (scx_cgroup_enabled) {
+	if (dummy_sched.avail_masks && scx_cgroup_enabled) {
 		if (SCX_HAS_OP(cgroup_init)) {
 			struct scx_cgroup_init_args args =
 				{ .weight = tg->scx_weight };
@@ -4023,7 +4026,8 @@ int scx_tg_online(struct task_group *tg)
 	 * Temporarily set task group's scheduler into curr_sched 
 	 * TODO: try to input task_group's scheduler
 	 */
-	tg->sched = curr_sched;
+	if (dummy_sched.avail_masks)
+		tg->sched = curr_sched;
 
 	percpu_up_read(&scx_cgroup_rwsem);
 	return ret;
@@ -5268,7 +5272,7 @@ static int validate_ops(const struct sched_ext_ops *ops)
 	return 0;
 }
 
-static int scx_sched_init(struct scx_scheduler **sched, struct task_group *root_grp)
+static int scx_sched_init(struct scx_scheduler *sched, struct task_group *root_grp)
 {
 	int ret = 0, node, i;
 
@@ -5280,34 +5284,29 @@ static int scx_sched_init(struct scx_scheduler **sched, struct task_group *root_
 	// 	goto err;
 	// }
 	// *sched = &sched_prio->sched;
-	*sched = kzalloc(sizeof(struct scx_scheduler), GFP_KERNEL);
-	if (!(*sched)) {
-		ret = -ENOMEM;
-		goto err;
-	}
 	/* TODO: Temporarily use FIFO to handle multiple schedulers */
 	// list_add_tail(&sched_prio->prio_node, &sched_prio_head.prio_list);
 
-	BUG_ON(rhashtable_init(&(*sched)->dsq_hash, &dsq_hash_params));
+	BUG_ON(rhashtable_init(&sched->dsq_hash, &dsq_hash_params));
 
 #ifdef CONFIG_SMP
-	BUG_ON(!alloc_cpumask_var(&(*sched)->avail_masks, GFP_KERNEL));
+	BUG_ON(!alloc_cpumask_var(&sched->avail_masks, GFP_KERNEL));
 
 	struct cpuset *cs = css_cs(&root_grp->css);
-	cpumask_copy((*sched)->avail_masks, cs->effective_cpus);
-	for_each_cpu(i, (*sched)->avail_masks) {
+	cpumask_copy(sched->avail_masks, cs->effective_cpus);
+	for_each_cpu(i, sched->avail_masks) {
 		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
-		if (*cpu_sched != &dummy_sched) {
-			free_cpumask_var((*sched)->avail_masks);
+		if (sched != &dummy_sched && *cpu_sched != &dummy_sched) {
+			free_cpumask_var(sched->avail_masks);
 			pr_err("sched_ext: Multiple schedulers in one core is not supported\n");
 			ret = -EINVAL;
 			goto err;
 		}
-		*cpu_sched = *sched;
+		*cpu_sched = sched;
 	}
 #endif
 
-	if (!(*sched)->global_dsqs) {
+	if (!sched->global_dsqs) {
 		struct scx_dispatch_q **dsqs;
 
 		dsqs = kcalloc(nr_node_ids, sizeof(dsqs[0]), GFP_KERNEL);
@@ -5321,7 +5320,7 @@ static int scx_sched_init(struct scx_scheduler **sched, struct task_group *root_
 			/*
 			 * skip the node if it avail_masks is not including the node
 			 */
-			if (!cpumask_intersects(node_mask, (*sched)->avail_masks)) {
+			if (!cpumask_intersects(node_mask, sched->avail_masks)) {
 				dsqs[node] = NULL;
 				continue;
 			}
@@ -5340,17 +5339,17 @@ static int scx_sched_init(struct scx_scheduler **sched, struct task_group *root_
 			dsqs[node] = dsq;
 		}
 
-		(*sched)->global_dsqs = dsqs;
+		sched->global_dsqs = dsqs;
 	}
 
-	(*sched)->root_tsk_grp = root_grp;
-	(*sched)->scx_ops_enable_state_var = (atomic_t)ATOMIC_INIT(SCX_OPS_DISABLED); 
-	(*sched)->scx_watchdog_timestamp = INITIAL_JIFFIES;
-	(*sched)->scx_exit_kind = (atomic_t)ATOMIC_INIT(SCX_EXIT_DONE);
-	(*sched)->scx_ops_disable_work = (struct kthread_work)
-		KTHREAD_WORK_INIT((*sched)->scx_ops_disable_work, scx_ops_disable_workfn);
-	(*sched)->scx_ops_error_irq_work = IRQ_WORK_INIT(scx_ops_error_irq_workfn);
-	INIT_DELAYED_WORK(&(*sched)->scx_watchdog_work, scx_watchdog_workfn);
+	sched->root_tsk_grp = root_grp;
+	sched->scx_ops_enable_state_var = (atomic_t)ATOMIC_INIT(SCX_OPS_DISABLED); 
+	sched->scx_watchdog_timestamp = INITIAL_JIFFIES;
+	sched->scx_exit_kind = (atomic_t)ATOMIC_INIT(SCX_EXIT_DONE);
+	sched->scx_ops_disable_work = (struct kthread_work)
+		KTHREAD_WORK_INIT(sched->scx_ops_disable_work, scx_ops_disable_workfn);
+	sched->scx_ops_error_irq_work = IRQ_WORK_INIT(scx_ops_error_irq_workfn);
+	INIT_DELAYED_WORK(&sched->scx_watchdog_work, scx_watchdog_workfn);
 err:
 	return ret;
 }
@@ -5375,7 +5374,13 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 		ops->root_group = &root_task_group;
 	}
 
-	if ((ret = scx_sched_init(&sched, ops->root_group))) {
+	sched = kzalloc(sizeof(struct scx_scheduler), GFP_KERNEL);
+	if (!sched) {
+		ret = -ENOMEM;
+		goto err_unlock;
+	}
+
+	if ((ret = scx_sched_init(sched, ops->root_group))) {
 		goto err_unlock;
 	}
 
@@ -7645,6 +7650,7 @@ static int __init scx_init(void)
 	}
 
 	// list_add_tail(&dummy_prio.prio_node, &sched_prio_head.prio_list);
+	scx_sched_init(&dummy_sched, &root_task_group);
 	/*
 	 * Give the value of basic scheduler to i_sched
 	 */
