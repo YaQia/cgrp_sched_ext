@@ -955,7 +955,7 @@ struct scx_scheduler {
 	bool			scx_builtin_idle_enabled:1;
 } dummy_sched;
 
-static DEFINE_PER_CPU(struct scx_scheduler *, _curr_sched);
+static DEFINE_PER_CPU(struct scx_scheduler *, _curr_sched) = NULL;
 
 static __always_inline struct scx_scheduler *get_curr_sched(void)
 {
@@ -1120,10 +1120,13 @@ static __printf(3, 4) void scx_ops_exit_kind(enum scx_exit_kind kind,
 #define scx_ops_error(fmt, args...)						\
 	scx_ops_error_kind(SCX_EXIT_ERROR, fmt, ##args)
 
-#define SCX_HAS_OP(op)	likely(test_bit(SCX_OP_IDX(op), curr_sched->scx_has_op))
+/* explicitly initialized curr_sched to NULL */
+#define SCX_HAS_OP(op)								\
+	(curr_sched && likely(test_bit(SCX_OP_IDX(op), curr_sched->scx_has_op)))
 
+/* sched in task_group is zeroed by default, so sched != NULL means valid ptr */
 #define SCX_SCHED_HAS_OP(sched, op)						\
-	likely(test_bit(SCX_OP_IDX(op), sched->scx_has_op))
+	(sched && likely(test_bit(SCX_OP_IDX(op), sched->scx_has_op)))
 
 static long jiffies_delta_msecs(unsigned long at, unsigned long now)
 {
@@ -1589,6 +1592,10 @@ static struct task_struct *scx_task_iter_next_locked(struct scx_task_iter *iter)
 
 static enum scx_ops_enable_state scx_ops_enable_state(void)
 {
+	// indicates that dummy_sched is not initialized, we are in the early init state.
+	if (!scx_enabled()) {
+		return SCX_OPS_DISABLED;
+	}
 	return atomic_read(&curr_sched->scx_ops_enable_state_var);
 }
 
@@ -3967,9 +3974,6 @@ static bool cgroup_warned_missing_idle;
 
 static void scx_cgroup_warn_missing_weight(struct task_group *tg)
 {
-	// indicates that dummy_sched is not initialized, we are in the early init state.
-	if (!dummy_sched.avail_masks)
-		return;
 	if (scx_ops_enable_state() == SCX_OPS_DISABLED ||
 	    cgroup_warned_missing_weight)
 		return;
@@ -4006,7 +4010,7 @@ int scx_tg_online(struct task_group *tg)
 
 	scx_cgroup_warn_missing_weight(tg);
 
-	if (dummy_sched.avail_masks && scx_cgroup_enabled) {
+	if (scx_enabled() && scx_cgroup_enabled) {
 		if (SCX_HAS_OP(cgroup_init)) {
 			struct scx_cgroup_init_args args =
 				{ .weight = tg->scx_weight };
@@ -4026,7 +4030,7 @@ int scx_tg_online(struct task_group *tg)
 	 * Temporarily set task group's scheduler into curr_sched 
 	 * TODO: try to input task_group's scheduler
 	 */
-	if (dummy_sched.avail_masks)
+	if (scx_enabled())
 		tg->sched = curr_sched;
 
 	percpu_up_read(&scx_cgroup_rwsem);
@@ -5292,8 +5296,15 @@ static int scx_sched_init(struct scx_scheduler *sched, struct task_group *root_g
 #ifdef CONFIG_SMP
 	BUG_ON(!alloc_cpumask_var(&sched->avail_masks, GFP_KERNEL));
 
-	struct cpuset *cs = css_cs(&root_grp->css);
+	struct cpuset *cs = container_of(root_grp->css.cgroup->subsys[cpuset_cgrp_id],
+					 struct cpuset, css);
+	if (!cs->effective_cpus) {
+		pr_err("sched_ext: root task_group cpuset has not been set\n");
+		ret = -EINVAL;
+		goto err;
+	}
 	cpumask_copy(sched->avail_masks, cs->effective_cpus);
+
 	for_each_cpu(i, sched->avail_masks) {
 		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
 		if (sched != &dummy_sched && *cpu_sched != &dummy_sched) {
