@@ -1122,11 +1122,11 @@ static __printf(3, 4) void scx_ops_exit_kind(enum scx_exit_kind kind,
 
 /* explicitly initialized curr_sched to NULL */
 #define SCX_HAS_OP(op)								\
-	(curr_sched && likely(test_bit(SCX_OP_IDX(op), curr_sched->scx_has_op)))
+	likely(test_bit(SCX_OP_IDX(op), curr_sched->scx_has_op))
 
 /* sched in task_group is zeroed by default, so sched != NULL means valid ptr */
 #define SCX_SCHED_HAS_OP(sched, op)						\
-	(sched && likely(test_bit(SCX_OP_IDX(op), sched->scx_has_op)))
+	likely(test_bit(SCX_OP_IDX(op), sched->scx_has_op))
 
 static long jiffies_delta_msecs(unsigned long at, unsigned long now)
 {
@@ -3461,6 +3461,9 @@ static void handle_hotplug(struct rq *rq, bool online)
 
 	atomic_long_inc(&scx_hotplug_seq);
 
+	if (!scx_enabled())
+		return;
+
 	if (online && SCX_HAS_OP(cpu_online))
 		SCX_CALL_OP(SCX_KF_UNLOCKED, cpu_online, cpu);
 	else if (!online && SCX_HAS_OP(cpu_offline))
@@ -4008,9 +4011,11 @@ int scx_tg_online(struct task_group *tg)
 
 	percpu_down_read(&scx_cgroup_rwsem);
 
-	scx_cgroup_warn_missing_weight(tg);
+	if (scx_enabled()) {
+		scx_cgroup_warn_missing_weight(tg);
+	}
 
-	if (scx_enabled() && scx_cgroup_enabled) {
+	if (scx_cgroup_enabled) {
 		if (SCX_HAS_OP(cgroup_init)) {
 			struct scx_cgroup_init_args args =
 				{ .weight = tg->scx_weight };
@@ -4027,10 +4032,11 @@ int scx_tg_online(struct task_group *tg)
 	}
 
 	/*
-	 * Temporarily set task group's scheduler into curr_sched 
-	 * TODO: try to input task_group's scheduler
+	 * If dummy_sched.avail_masks is NULL, it means all scx_scheds are
+	 * not initialized. This init should be done in scx_init, but some
+	 * scx functions are called beforehand, we need to double check.
 	 */
-	if (scx_enabled())
+	if (likely(dummy_sched.avail_masks))
 		tg->sched = curr_sched;
 
 	percpu_up_read(&scx_cgroup_rwsem);
@@ -4043,7 +4049,7 @@ void scx_tg_offline(struct task_group *tg)
 
 	percpu_down_read(&scx_cgroup_rwsem);
 
-	if (SCX_HAS_OP(cgroup_exit) 
+	if (scx_enabled() && SCX_HAS_OP(cgroup_exit) 
 	    && (tg->scx_flags & SCX_TG_INITED))
 		SCX_CALL_OP(SCX_KF_UNLOCKED, cgroup_exit, tg->css.cgroup);
 	tg->scx_flags &= ~(SCX_TG_ONLINE | SCX_TG_INITED);
@@ -7660,14 +7666,12 @@ static int __init scx_init(void)
 		return ret;
 	}
 
-	// list_add_tail(&dummy_prio.prio_node, &sched_prio_head.prio_list);
 	scx_sched_init(&dummy_sched, &root_task_group);
 	/*
 	 * Give the value of basic scheduler to i_sched
 	 */
 	for_each_possible_cpu(i) {
 		struct scx_scheduler **i_sched = per_cpu_ptr(&_curr_sched, i);
-		// *i_sched = &dummy_prio.sched;
 		*i_sched = &dummy_sched;
 	}
 
