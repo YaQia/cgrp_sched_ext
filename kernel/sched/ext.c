@@ -959,7 +959,13 @@ static DEFINE_PER_CPU(struct scx_scheduler *, _curr_sched) = NULL;
 
 static __always_inline struct scx_scheduler *get_curr_sched(void)
 {
-	return this_cpu_ptr(_curr_sched);
+	struct scx_scheduler *sched = this_cpu_ptr(_curr_sched);
+	if (unlikely(!sched)) {
+		pr_err("Current scheduler is not initialized "
+		       "for CPU %d\n", smp_processor_id());
+		*this_cpu_ptr(&_curr_sched) = &dummy_sched;
+	}
+	return sched;
 }
 
 #define curr_sched get_curr_sched()
@@ -1592,10 +1598,6 @@ static struct task_struct *scx_task_iter_next_locked(struct scx_task_iter *iter)
 
 static enum scx_ops_enable_state scx_ops_enable_state(void)
 {
-	// indicates that dummy_sched is not initialized, we are in the early init state.
-	if (!scx_enabled()) {
-		return SCX_OPS_DISABLED;
-	}
 	return atomic_read(&curr_sched->scx_ops_enable_state_var);
 }
 
@@ -4015,7 +4017,7 @@ int scx_tg_online(struct task_group *tg)
 		scx_cgroup_warn_missing_weight(tg);
 	}
 
-	if (scx_cgroup_enabled) {
+	if (scx_enabled() && scx_cgroup_enabled) {
 		if (SCX_HAS_OP(cgroup_init)) {
 			struct scx_cgroup_init_args args =
 				{ .weight = tg->scx_weight };
