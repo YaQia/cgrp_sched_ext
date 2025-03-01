@@ -36,7 +36,6 @@
 // #include "smp.h"
 //
 // #include "autogroup.h"
-// // #include "stats.h"
 // #include "pelt.h"
 #include "../cgroup/cpuset-internal.h"
 // NOLINTBEGIN(bugprone-sizeof-expression)
@@ -672,11 +671,6 @@ struct sched_ext_ops {
 	void (*exit)(struct scx_exit_info *info);
 
 	/**
-	 * root_group - root task group for this scheduler
-	 */
-	struct task_group *root_group;
-
-	/**
 	 * dispatch_max_batch - Max nr of tasks that dispatch() can dispatch
 	 */
 	u32 dispatch_max_batch;
@@ -709,6 +703,11 @@ struct sched_ext_ops {
 	 * enable path.
 	 */
 	u64 hotplug_seq;
+
+	/**
+	 * root_cgroup_path - root cgroup path for this scheduler
+	 */
+	char root_cgroup_path[PATH_MAX];
 
 	/**
 	 * name - BPF scheduler's name
@@ -959,7 +958,7 @@ static DEFINE_PER_CPU(struct scx_scheduler *, _curr_sched) = NULL;
 
 static __always_inline struct scx_scheduler *get_curr_sched(void)
 {
-	struct scx_scheduler *sched = this_cpu_ptr(_curr_sched);
+	struct scx_scheduler *sched = this_cpu_read(_curr_sched);
 	if (unlikely(!sched)) {
 		pr_err("Current scheduler is not initialized "
 		       "for CPU %d\n", smp_processor_id());
@@ -3367,10 +3366,13 @@ static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flag
 		cpu = SCX_CALL_OP_TASK_RET(SCX_KF_ENQUEUE | SCX_KF_SELECT_CPU,
 					   select_cpu, p, prev_cpu, wake_flags);
 		*ddsp_taskp = NULL;
-		if (ops_cpu_valid(cpu, "from ops.select_cpu()"))
+		if (ops_cpu_valid(cpu, "from ops.select_cpu()")) {
+			pr_info("sched_ext: %s selected cpu %d\n", p->comm, cpu);
 			return cpu;
-		else
+		} else {
+			pr_info("sched_ext: %s selected cpu %d\n", p->comm, prev_cpu);
 			return prev_cpu;
+		}
 	} else {
 		bool found;
 		s32 cpu;
@@ -3380,6 +3382,7 @@ static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flag
 			p->scx.slice = SCX_SLICE_DFL;
 			p->scx.ddsp_dsq_id = SCX_DSQ_LOCAL;
 		}
+		pr_info("sched_ext: %s selected cpu %d\n", p->comm, cpu);
 		return cpu;
 	}
 }
@@ -4883,12 +4886,12 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	}
 	kfree(sched->global_dsqs);
 	kfree(sched->avail_masks);
-	kfree(sched);
-
-	mutex_unlock(&scx_ops_enable_mutex);
 
 	WARN_ON_ONCE(scx_ops_set_enable_state(SCX_OPS_DISABLED) !=
 		     SCX_OPS_DISABLING);
+	kfree(sched);
+
+	mutex_unlock(&scx_ops_enable_mutex);
 done:
 	scx_ops_bypass(false);
 }
@@ -5378,6 +5381,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	struct scx_task_iter sti;
 	struct task_struct *p;
 	struct scx_scheduler *sched, *tmp_sched;
+	struct task_group *root_group;
 	unsigned long timeout;
 	int i, cpu, ret;
 
@@ -5389,8 +5393,17 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 
 	mutex_lock(&scx_ops_enable_mutex);
 	
-	if (!ops->root_group) {
-		ops->root_group = &root_task_group;
+	if (!strcmp(ops->root_cgroup_path, "")) {
+		pr_info("sched_ext: use root_task_group as root_group\n");
+		root_group = &root_task_group;
+	} else {
+		struct cgroup* root_cg = cgroup_get_from_path(ops->root_cgroup_path);
+		if (IS_ERR(root_cg)) {
+			pr_err("sched_ext: Invalid root_cgroup_path\n");
+			ret = PTR_ERR(root_cg);
+			goto err_unlock;
+		}
+		root_group = css_tg(root_cg->subsys[cpu_cgrp_id]);
 	}
 
 	sched = kzalloc(sizeof(struct scx_scheduler), GFP_KERNEL);
@@ -5399,7 +5412,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 		goto err_unlock;
 	}
 
-	if ((ret = scx_sched_init(sched, ops->root_group))) {
+	if ((ret = scx_sched_init(sched, root_group))) {
 		goto err_unlock;
 	}
 
@@ -5445,6 +5458,10 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	 * disable path. Failure triggers full disabling from here on.
 	 */
 	sched->scx_ops = *ops;
+
+	for_each_cpu(i, sched->avail_masks) {
+		pr_info("sched_ext: CPU %d curr_sched = %s\n", i, sched->scx_ops.name);
+	}
 
 	WARN_ON_ONCE(scx_ops_set_enable_state(SCX_OPS_ENABLING) !=
 		     SCX_OPS_DISABLED);
@@ -5847,6 +5864,16 @@ static int bpf_scx_init_member(const struct btf_type *t,
 		if (*(u64 *)(udata + moff) & ~SCX_OPS_ALL_FLAGS)
 			return -EINVAL;
 		ops->flags = *(u64 *)(udata + moff);
+		return 1;
+	case offsetof(struct sched_ext_ops, root_cgroup_path):
+		ret = bpf_obj_name_cpy(ops->root_cgroup_path, 
+				       uops->root_cgroup_path,
+				       sizeof(
+				       ops->root_cgroup_path));
+		if (ret < 0)
+			return ret;
+		if (ret == 0)
+			return -EINVAL;
 		return 1;
 	case offsetof(struct sched_ext_ops, name):
 		ret = bpf_obj_name_cpy(ops->name, uops->name,

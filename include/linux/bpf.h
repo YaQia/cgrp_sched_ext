@@ -1722,9 +1722,11 @@ struct btf_member;
  *		  is valid. A nonzero return value means that the map is
  *		  invalid and should be rejected by the verifier.
  * @init_member: A callback that is invoked for each member of the struct_ops
- *		 map to allow the subsystem to initialize the member. A nonzero
- *		 value means the member could not be initialized. This callback
- *		 is exclusive with the @type, @type_id, @value_type, and
+ *		 map to allow the subsystem to initialize the member. A 
+ *		 negative value means the member could not be initialized, a 
+ *		 positive value means this function should be call again to 
+ *		 initialize other members of the struct_ops map. This callback
+ *		 is exclusive with the @type, @type_id, @value_type, and 
  *		 @value_id fields.
  * @reg: A callback that is invoked when the struct_ops map has been
  *	 initialized and is being attached to. Zero means the struct_ops map
