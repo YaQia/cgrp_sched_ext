@@ -1073,6 +1073,24 @@ int bpf_obj_name_cpy(char *dst, const char *src, unsigned int size)
 	return src - orig_src;
 }
 
+int bpf_obj_str_cpy(char *dst, const char *src, unsigned int size)
+{
+	const char *end = src + size;
+	const char *orig_src = src;
+
+	memset(dst, 0, size);
+	/* Copy all isalnum(), '_' and '.' chars. */
+	while (src < end && *src) {
+		*dst++ = *src++;
+	}
+
+	/* No '\0' found in "size" number of bytes */
+	if (src == end)
+		return -EINVAL;
+
+	return src - orig_src;
+}
+
 int map_check_no_btf(const struct bpf_map *map,
 		     const struct btf *btf,
 		     const struct btf_type *key_type,

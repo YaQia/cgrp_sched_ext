@@ -5861,21 +5861,27 @@ static int bpf_scx_init_member(const struct btf_type *t,
 		ops->dispatch_max_batch = *(u32 *)(udata + moff);
 		return 1;
 	case offsetof(struct sched_ext_ops, flags):
+		pr_info("sched_ext: init flags\n");
 		if (*(u64 *)(udata + moff) & ~SCX_OPS_ALL_FLAGS)
 			return -EINVAL;
 		ops->flags = *(u64 *)(udata + moff);
 		return 1;
 	case offsetof(struct sched_ext_ops, root_cgroup_path):
-		ret = bpf_obj_name_cpy(ops->root_cgroup_path, 
-				       uops->root_cgroup_path,
-				       sizeof(
-				       ops->root_cgroup_path));
-		if (ret < 0)
-			return ret;
-		if (ret == 0)
-			return -EINVAL;
+		// copy_from_user()
+		ret = copy_from_user(ops->root_cgroup_path, 
+				     uops->root_cgroup_path,
+				     sizeof(ops->root_cgroup_path));
+		pr_info("sched_ext: init root_cgroup_path, "
+			"ops->root_cgroup_path = %s, "
+			"uops->root_cgroup_path = %s\n", 
+			ops->root_cgroup_path,
+			uops->root_cgroup_path);
+		if (ret != 0) {
+			return -EFAULT;
+		}
 		return 1;
 	case offsetof(struct sched_ext_ops, name):
+		pr_info("sched_ext: init name\n");
 		ret = bpf_obj_name_cpy(ops->name, uops->name,
 				       sizeof(ops->name));
 		if (ret < 0)
