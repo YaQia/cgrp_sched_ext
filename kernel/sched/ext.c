@@ -959,12 +959,12 @@ static DEFINE_PER_CPU(struct scx_scheduler *, _curr_sched) = NULL;
 static __always_inline struct scx_scheduler *get_curr_sched(void)
 {
 	struct scx_scheduler *sched = this_cpu_read(_curr_sched);
-	if (unlikely(!sched)) {
-		pr_err("Current scheduler is not initialized "
-		       "for CPU %d\n", smp_processor_id());
-		this_cpu_write(_curr_sched, &dummy_sched);
-		sched = &dummy_sched;
-	}
+	// if (unlikely(!sched)) {
+	// 	pr_err("Current scheduler is not initialized "
+	// 	       "for CPU %d\n", smp_processor_id());
+	// 	this_cpu_write(_curr_sched, &dummy_sched);
+	// 	sched = &dummy_sched;
+	// }
 	return sched;
 }
 
@@ -3190,7 +3190,9 @@ static struct task_struct *pick_task_scx(struct rq *rq)
 	// }
 	
 	if (p->sched_task_group->sched != curr_sched) {
-		pr_info("switch sched");
+		pr_info("switch sched from %s into %s",
+			curr_sched->scx_ops.name, 
+			p->sched_task_group->sched->scx_ops.name);
 		switch_this_cpu_curr_sched(p->sched_task_group->sched);
 	}
 	return p;
@@ -5493,7 +5495,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	cpus_read_lock();
 
 	if (sched->scx_ops.init) {
-		ret = SCX_CALL_OP_RET(SCX_KF_UNLOCKED, init);
+		ret = SCX_SCHED_CALL_OP_RET(sched, SCX_KF_UNLOCKED, init);
 		if (ret) {
 			ret = ops_sanitize_err("init", ret);
 			cpus_read_unlock();
@@ -7707,6 +7709,8 @@ static int __init scx_init(void)
 	}
 
 	scx_sched_init(&dummy_sched, &root_task_group);
+	dummy_sched.scx_ops = __bpf_ops_sched_ext_ops;
+	strscpy(dummy_sched.scx_ops.name, "dummy");
 	/*
 	 * Give the value of basic scheduler to i_sched
 	 */
