@@ -962,17 +962,27 @@ static __always_inline struct scx_scheduler *get_curr_sched(void)
 	if (unlikely(!sched)) {
 		pr_err("Current scheduler is not initialized "
 		       "for CPU %d\n", smp_processor_id());
-		*this_cpu_ptr(&_curr_sched) = &dummy_sched;
+		this_cpu_write(_curr_sched, &dummy_sched);
+		sched = &dummy_sched;
 	}
 	return sched;
 }
 
 #define curr_sched get_curr_sched()
 
-/* Temporarily change the curr_sched into this scheduler */
-#define switch_curr_sched(tmp_sched)				\
+#define switch_this_cpu_curr_sched(sched)			\
 do {								\
-	tmp_sched = this_cpu_xchg(_curr_sched, tmp_sched);	\
+	this_cpu_xchg(_curr_sched, sched);			\
+} while(0)
+
+/* Change the curr sched back to prev sched */
+#define switch_curr_sched(curr, prev)				\
+do {								\
+	for_each_cpu(i, curr->avail_masks) {			\
+		struct scx_scheduler **cpu_sched =		\
+			per_cpu_ptr(&_curr_sched, i);		\
+		*cpu_sched = prev;				\
+	}							\
 } while(0)
 
 // struct scx_sched_prio {
@@ -3174,6 +3184,15 @@ static struct task_struct *pick_task_scx(struct rq *rq)
 		}
 	}
 
+	// if (!cgroup_is_descendant(task_dfl_cgroup(p), 
+	// 			  curr_sched->root_tsk_grp->css.cgroup)) {
+	// 	switch_this_cpu_curr_sched(p->sched_task_group->sched);
+	// }
+	
+	if (p->sched_task_group->sched != curr_sched) {
+		pr_info("switch sched");
+		switch_this_cpu_curr_sched(p->sched_task_group->sched);
+	}
 	return p;
 }
 
@@ -3367,10 +3386,8 @@ static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flag
 					   select_cpu, p, prev_cpu, wake_flags);
 		*ddsp_taskp = NULL;
 		if (ops_cpu_valid(cpu, "from ops.select_cpu()")) {
-			pr_info("sched_ext: %s selected cpu %d\n", p->comm, cpu);
 			return cpu;
 		} else {
-			pr_info("sched_ext: %s selected cpu %d\n", p->comm, prev_cpu);
 			return prev_cpu;
 		}
 	} else {
@@ -3382,7 +3399,6 @@ static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flag
 			p->scx.slice = SCX_SLICE_DFL;
 			p->scx.ddsp_dsq_id = SCX_DSQ_LOCAL;
 		}
-		pr_info("sched_ext: %s selected cpu %d\n", p->comm, cpu);
 		return cpu;
 	}
 }
@@ -5380,7 +5396,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 {
 	struct scx_task_iter sti;
 	struct task_struct *p;
-	struct scx_scheduler *sched, *tmp_sched;
+	struct scx_scheduler *sched;
 	struct task_group *root_group;
 	unsigned long timeout;
 	int i, cpu, ret;
@@ -5413,7 +5429,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	}
 
 	if ((ret = scx_sched_init(sched, root_group))) {
-		goto err_unlock;
+		goto err_sched;
 	}
 
 	if (!scx_ops_helper) {
@@ -5421,25 +5437,21 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 			   scx_create_rt_helper("sched_ext_ops_helper"));
 		if (!scx_ops_helper) {
 			ret = -ENOMEM;
-			goto err_unlock;
+			goto err_sched;
 		}
 	}
 
-	tmp_sched = sched;
-
-	// switch_curr_sched(tmp_sched);
-
 	if (scx_ops_enable_state() != SCX_OPS_DISABLED) {
 		ret = -EBUSY;
-		switch_curr_sched(tmp_sched);
-		goto err_unlock;
+		switch_curr_sched(sched, &dummy_sched);
+		goto err_sched;
 	}
 
 	scx_root_kobj = kzalloc(sizeof(*scx_root_kobj), GFP_KERNEL);
 	if (!scx_root_kobj) {
 		ret = -ENOMEM;
-		switch_curr_sched(tmp_sched);
-		goto err_unlock;
+		switch_curr_sched(sched, &dummy_sched);
+		goto err_sched;
 	}
 
 	scx_root_kobj->kset = scx_kset;
@@ -5690,7 +5702,9 @@ err:
 		free_exit_info(sched->scx_exit_info);
 		sched->scx_exit_info = NULL;
 	}
-	switch_curr_sched(tmp_sched);
+	switch_curr_sched(sched, &dummy_sched);
+err_sched:
+	kfree(sched);
 err_unlock:
 	mutex_unlock(&scx_ops_enable_mutex);
 	return ret;
@@ -5700,7 +5714,7 @@ err_disable_unlock_all:
 	percpu_up_write(&scx_fork_rwsem);
 	scx_ops_bypass(false);
 err_disable:
-	switch_curr_sched(tmp_sched);
+	switch_curr_sched(sched, &dummy_sched);
 	mutex_unlock(&scx_ops_enable_mutex);
 	/*
 	 * Returning an error code here would not pass all the error information
