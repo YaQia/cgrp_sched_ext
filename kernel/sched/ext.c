@@ -4390,7 +4390,7 @@ static void scx_cgroup_exit(void)
 	rcu_read_unlock();
 }
 
-static int scx_cgroup_init(void)
+static int scx_cgroup_init(struct scx_scheduler *sched)
 {
 	struct cgroup_subsys_state *css;
 	int ret;
@@ -4405,9 +4405,9 @@ static int scx_cgroup_init(void)
 	 * cgroups and init, all online cgroups are initialized.
 	 */
 	rcu_read_lock();
-	css_for_each_descendant_pre(css, &root_task_group.css) {
+	css_for_each_descendant_pre(css, &sched->root_tsk_grp->css) {
 		struct task_group *tg = css_tg(css);
-		tg->sched = curr_sched;
+		tg->sched = sched;
 		struct scx_cgroup_init_args args = { .weight = tg->scx_weight };
 
 		scx_cgroup_warn_missing_weight(tg);
@@ -5308,7 +5308,6 @@ static int validate_ops(const struct sched_ext_ops *ops)
 static int scx_sched_init(struct scx_scheduler *sched, struct task_group *root_grp)
 {
 	int ret = 0, node, i;
-
 	/* Add scheduler into priority list */
 	// struct scx_sched_prio *sched_prio = kzalloc(sizeof(struct scx_sched_prio),
 	// 					    GFP_KERNEL);
@@ -5585,12 +5584,14 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	 * scx_cgroup_can_attach() never sees uninitialized tasks.
 	 */
 	scx_cgroup_lock();
-	ret = scx_cgroup_init();
+	ret = scx_cgroup_init(sched);
 	if (ret)
 		goto err_disable_unlock_all;
 
 	scx_task_iter_start(&sti);
 	while ((p = scx_task_iter_next_locked(&sti))) {
+		if (p->sched_task_group->sched != sched)
+			continue;
 		/*
 		 * @p may already be dead, have lost all its usages counts and
 		 * be waiting for RCU grace period before being freed. @p can't
@@ -5650,7 +5651,8 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 
 		sched_deq_and_put_task(p, DEQUEUE_SAVE | DEQUEUE_MOVE, &ctx);
 
-		p->scx.slice = SCX_SLICE_DFL;
+		if (p->sched_task_group->sched == sched)
+			p->scx.slice = SCX_SLICE_DFL;
 		p->sched_class = new_class;
 		check_class_changing(task_rq(p), p, old_class);
 
@@ -7709,8 +7711,16 @@ static int __init scx_init(void)
 	}
 
 	scx_sched_init(&dummy_sched, &root_task_group);
+	for (i = SCX_OPI_BEGIN; i < SCX_OPI_END; i++)
+		if (((void (**)(void))&__bpf_ops_sched_ext_ops)[i])
+			set_bit(i, dummy_sched.scx_has_op);
 	dummy_sched.scx_ops = __bpf_ops_sched_ext_ops;
 	strscpy(dummy_sched.scx_ops.name, "dummy");
+
+	WRITE_ONCE(dummy_sched.scx_watchdog_timeout, SCX_WATCHDOG_MAX_TIMEOUT);
+	WRITE_ONCE(dummy_sched.scx_watchdog_timestamp, jiffies);
+	queue_delayed_work(system_unbound_wq, &dummy_sched.scx_watchdog_work,
+			   dummy_sched.scx_watchdog_timeout / 2);
 	/*
 	 * Give the value of basic scheduler to i_sched
 	 */
