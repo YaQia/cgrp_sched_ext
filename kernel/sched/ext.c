@@ -3294,6 +3294,7 @@ static s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
 
 	*found = false;
 
+	struct scx_scheduler *sched = curr_sched;
 
 	/*
 	 * This is necessary to protect llc_cpus.
@@ -3313,9 +3314,9 @@ static s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
 	BUG_ON(!alloc_cpumask_var(&avail_idle_mask_cpu, GFP_KERNEL));
 	BUG_ON(!alloc_cpumask_var(&avail_idle_mask_smt, GFP_KERNEL));
 	cpumask_and(avail_idle_mask_cpu, idle_masks.cpu, 
-		    curr_sched->avail_masks);
+		    sched->avail_masks);
 	cpumask_and(avail_idle_mask_smt, idle_masks.smt, 
-		    curr_sched->avail_masks);
+		    sched->avail_masks);
 	cpu = smp_processor_id();
 	if ((wake_flags & SCX_WAKE_SYNC) &&
 	    !cpumask_empty(avail_idle_mask_cpu) 
@@ -3341,7 +3342,7 @@ static s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
 			goto cpu_found;
 	}
 
-	if (cpumask_test_cpu(prev_cpu, curr_sched->avail_masks) && 
+	if (cpumask_test_cpu(prev_cpu, sched->avail_masks) && 
 	    test_and_clear_cpu_idle(prev_cpu)) {
 		cpu = prev_cpu;
 		goto cpu_found;
@@ -4026,7 +4027,7 @@ static void scx_cgroup_warn_missing_idle(struct task_group *tg)
 	cgroup_warned_missing_idle = true;
 }
 
-int scx_tg_online(struct task_group *tg)
+int scx_tg_online(struct task_group *tg, struct task_group *parent_tg)
 {
 	int ret = 0;
 
@@ -4059,8 +4060,14 @@ int scx_tg_online(struct task_group *tg)
 	 * not initialized. This init should be done in scx_init, but some
 	 * scx functions are called beforehand, we need to double check.
 	 */
-	if (likely(dummy_sched.avail_masks))
-		tg->sched = curr_sched;
+	if (likely(dummy_sched.avail_masks)) {
+		if (unlikely(parent_tg == NULL))
+			tg->sched = &dummy_sched;
+		else
+			tg->sched = parent_tg->sched;
+	} else {
+		tg->sched = &dummy_sched;
+	}
 
 	percpu_up_read(&scx_cgroup_rwsem);
 	return ret;
@@ -4417,7 +4424,7 @@ static int scx_cgroup_init(struct scx_scheduler *sched)
 		     (SCX_TG_ONLINE | SCX_TG_INITED)) != SCX_TG_ONLINE)
 			continue;
 
-		if (!curr_sched->scx_ops.cgroup_init) {
+		if (!sched->scx_ops.cgroup_init) {
 			tg->scx_flags |= SCX_TG_INITED;
 			continue;
 		}
@@ -5590,8 +5597,6 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 
 	scx_task_iter_start(&sti);
 	while ((p = scx_task_iter_next_locked(&sti))) {
-		if (p->sched_task_group->sched != sched)
-			continue;
 		/*
 		 * @p may already be dead, have lost all its usages counts and
 		 * be waiting for RCU grace period before being freed. @p can't
@@ -7712,15 +7717,14 @@ static int __init scx_init(void)
 
 	scx_sched_init(&dummy_sched, &root_task_group);
 	for (i = SCX_OPI_BEGIN; i < SCX_OPI_END; i++)
-		if (((void (**)(void))&__bpf_ops_sched_ext_ops)[i])
-			set_bit(i, dummy_sched.scx_has_op);
-	dummy_sched.scx_ops = __bpf_ops_sched_ext_ops;
+		clear_bit(i, dummy_sched.scx_has_op);
 	strscpy(dummy_sched.scx_ops.name, "dummy");
 
-	WRITE_ONCE(dummy_sched.scx_watchdog_timeout, SCX_WATCHDOG_MAX_TIMEOUT);
-	WRITE_ONCE(dummy_sched.scx_watchdog_timestamp, jiffies);
-	queue_delayed_work(system_unbound_wq, &dummy_sched.scx_watchdog_work,
-			   dummy_sched.scx_watchdog_timeout / 2);
+	// scx_cgroup_init(&dummy_sched);
+	// WRITE_ONCE(dummy_sched.scx_watchdog_timeout, SCX_WATCHDOG_MAX_TIMEOUT);
+	// WRITE_ONCE(dummy_sched.scx_watchdog_timestamp, jiffies);
+	// queue_delayed_work(system_unbound_wq, &dummy_sched.scx_watchdog_work,
+	// 		   dummy_sched.scx_watchdog_timeout / 2);
 	/*
 	 * Give the value of basic scheduler to i_sched
 	 */

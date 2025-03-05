@@ -9007,7 +9007,7 @@ static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
 	struct task_group *parent = css_tg(css->parent);
 	int ret;
 
-	ret = scx_tg_online(tg);
+	ret = scx_tg_online(tg, parent);
 	if (ret)
 		return ret;
 
