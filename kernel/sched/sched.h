@@ -761,7 +761,8 @@ enum scx_rq_flags {
 };
 
 struct scx_rq {
-	struct scx_dispatch_q	local_dsq;
+	struct scx_scheduler	*sched[2];
+	struct scx_dispatch_q	local_dsq[2];
 	struct list_head	runnable_list;		/* runnable tasks on this rq */
 	struct list_head	ddsp_deferred_locals;	/* deferred ddsps from enq */
 	unsigned long		ops_qseq;
