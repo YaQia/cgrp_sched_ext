@@ -913,6 +913,9 @@ static struct {
  */
 static unsigned long scx_watchdog_timeout;
 
+static struct delayed_work scx_watchdog_work;
+
+static size_t sched_cnt;
 /*
  * The last time the delayed work was run. This delayed work relies on
  * ksoftirqd being able to run to service timer interrupts, so it's possible
@@ -940,7 +943,6 @@ struct scx_scheduler {
 	/* use bitmap to reduce memory consumption */
 	DECLARE_BITMAP(scx_has_op, SCX_OPI_END);
 
-	struct delayed_work	scx_watchdog_work;
 	struct kthread_work	scx_ops_disable_work;
 	struct irq_work		scx_ops_error_irq_work;
 
@@ -2981,6 +2983,7 @@ static void process_ddsp_deferred_locals(struct rq *rq)
 
 static void set_next_task_scx(struct rq *rq, struct task_struct *p, bool first)
 {
+	switch_this_cpu_curr_sched(task_group(p)->sched);
 	if (p->scx.flags & SCX_TASK_QUEUED) {
 		/*
 		 * Core-sched might decide to execute @p before it is
@@ -3085,9 +3088,6 @@ static void switch_class(struct rq *rq, struct task_struct *prev,
 static void put_prev_task_scx(struct rq *rq, struct task_struct *p,
 			      struct task_struct *next)
 {
-	if (task_group(p)->sched != curr_sched) {
-		scx_ops_error("select_task_rq_scx curr_sched != task %s sched.\n", p->comm);
-	}
 	update_curr_scx(rq);
 
 	/* see dequeue_task_scx() on why we skip when !QUEUED */
@@ -3127,10 +3127,6 @@ static void put_prev_task_scx(struct rq *rq, struct task_struct *p,
 	if (next) {
 		if (next->sched_class != &ext_sched_class)
 			switch_class(rq, p, next);
-		/*
-		 * switch_class need the prev scheduler, don't switch before it.
-		 */
-		switch_this_cpu_curr_sched(task_group(next)->sched);
 	}
 }
 
@@ -4437,22 +4433,23 @@ out_unlock_rcu:
 }
 
 #ifdef CONFIG_EXT_GROUP_SCHED
-static void scx_cgroup_exit(void)
+static void scx_cgroup_exit(struct scx_scheduler *sched)
 {
 	struct cgroup_subsys_state *css;
 
 	percpu_rwsem_assert_held(&scx_cgroup_rwsem);
 
-	scx_cgroup_enabled = false;
+	if (sched_cnt == 1)
+		scx_cgroup_enabled = false;
 
 	/*
 	 * scx_tg_on/offline() are excluded through scx_cgroup_rwsem. If we walk
 	 * cgroups and exit all the inited ones, all online cgroups are exited.
 	 */
 	rcu_read_lock();
-	css_for_each_descendant_post(css, &root_task_group.css) {
+	sched = switch_this_cpu_curr_sched(sched);
+	css_for_each_descendant_post(css, &sched->root_tsk_grp->css) {
 		struct task_group *tg = css_tg(css);
-		struct scx_scheduler *sched = tg->sched;
 
 		if (!(tg->scx_flags & SCX_TG_INITED))
 			continue;
@@ -4465,13 +4462,12 @@ static void scx_cgroup_exit(void)
 			continue;
 		rcu_read_unlock();
 
-		sched = switch_this_cpu_curr_sched(sched);
 		SCX_CALL_OP(SCX_KF_UNLOCKED, cgroup_exit, css->cgroup);
-		switch_this_cpu_curr_sched(sched);
 
 		rcu_read_lock();
 		css_put(css);
 	}
+	switch_this_cpu_curr_sched(sched);
 	rcu_read_unlock();
 }
 
@@ -4846,7 +4842,6 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	default:
 		break;
 	}
-	switch_this_cpu_curr_sched(this_cpu_sched);
 
 	/*
 	 * Here, every runnable task is guaranteed to make forward progress and
@@ -4855,15 +4850,17 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	 */
 	mutex_lock(&scx_ops_enable_mutex);
 
-	static_branch_disable(&__scx_switched_all);
-	WRITE_ONCE(scx_switching_all, false);
+	if (sched != &dummy_sched && sched_cnt == 1) {
+		static_branch_disable(&__scx_switched_all);
+		WRITE_ONCE(scx_switching_all, false);
+	}
 
 	/*
 	 * Shut down cgroup support before tasks so that the cgroup attach path
 	 * doesn't race against scx_ops_exit_task().
 	 */
 	scx_cgroup_lock();
-	scx_cgroup_exit();
+	scx_cgroup_exit(sched);
 	scx_cgroup_unlock();
 
 	/*
@@ -4872,7 +4869,8 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	 */
 	percpu_down_write(&scx_fork_rwsem);
 
-	scx_ops_init_task_enabled = false;
+	if (sched != &dummy_sched && sched_cnt == 1)
+		scx_ops_init_task_enabled = false;
 
 	scx_task_iter_start(&sti);
 	while ((p = scx_task_iter_next_locked(&sti))) {
@@ -4926,7 +4924,8 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	}
 
 	/* no task is on scx, turn off all the switches and flush in-progress calls */
-	static_branch_disable(&__scx_ops_enabled);
+	if (sched != &dummy_sched && sched_cnt == 1)
+		static_branch_disable(&__scx_ops_enabled);
 	for (i = SCX_OPI_BEGIN; i < SCX_OPI_END; i++)
 		clear_bit(i, sched->scx_has_op);
 	sched->scx_ops_enq_last = false;
@@ -4950,12 +4949,11 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	}
 
 	if (sched->scx_ops.exit) {
-		sched = switch_this_cpu_curr_sched(sched);
 		SCX_CALL_OP(SCX_KF_UNLOCKED, exit, ei);
-		switch_this_cpu_curr_sched(sched);
 	}
 
-	cancel_delayed_work_sync(&sched->scx_watchdog_work);
+	if (sched != &dummy_sched && sched_cnt == 1)
+		cancel_delayed_work_sync(&scx_watchdog_work);
 
 	/*
 	 * Delete the kobject from the hierarchy eagerly in addition to just
@@ -4980,9 +4978,11 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	} while (dsq == ERR_PTR(-EAGAIN));
 	rhashtable_walk_exit(&rht_iter);
 
-	free_percpu(scx_dsp_ctx);
-	scx_dsp_ctx = NULL;
-	scx_dsp_max_batch = 0;
+	if (sched != &dummy_sched && sched_cnt == 1) {
+		free_percpu(scx_dsp_ctx);
+		scx_dsp_ctx = NULL;
+		scx_dsp_max_batch = 0;
+	}
 
 	free_exit_info(sched->scx_exit_info);
 	sched->scx_exit_info = NULL;
@@ -4996,12 +4996,17 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	}
 	kfree(sched->global_dsqs);
 	kfree(sched->avail_mask);
+	kfree(sched->idle_mask_cpu);
+	kfree(sched->idle_mask_smt);
 
-	this_cpu_sched = switch_this_cpu_curr_sched(sched);
 	WARN_ON_ONCE(scx_ops_set_enable_state(SCX_OPS_DISABLED) !=
 		     SCX_OPS_DISABLING);
 	switch_this_cpu_curr_sched(this_cpu_sched);
-	kfree(sched);
+
+	if (sched != &dummy_sched) {
+		kfree(sched);
+		sched_cnt -= 1;
+	}
 
 	mutex_unlock(&scx_ops_enable_mutex);
 done:
@@ -5022,16 +5027,48 @@ static void schedule_scx_ops_disable_work(struct scx_scheduler *sched)
 		kthread_queue_work(helper, &sched->scx_ops_disable_work);
 }
 
-static void scx_ops_disable(enum scx_exit_kind kind)
+static void scx_ops_disable(struct sched_ext_ops *ops, enum scx_exit_kind kind)
 {
-	int none = SCX_EXIT_NONE;
+	int none = SCX_EXIT_NONE, i;
+	struct scx_scheduler *sched = NULL;
+
+	/* Unregister all schedulers */
+	if (!ops) {
+		while (true) {
+			for_each_online_cpu(i) {
+				sched = cpu_rq(i)->scx.sched[1];
+				if (sched) {
+					break;
+				}
+			}
+			if (!sched)
+				break;
+			atomic_try_cmpxchg(&sched->scx_exit_kind, &none,
+					   kind);
+			schedule_scx_ops_disable_work(sched);
+		}
+		return;
+	}
 
 	if (WARN_ON_ONCE(kind == SCX_EXIT_NONE || kind == SCX_EXIT_DONE))
 		kind = SCX_EXIT_ERROR;
 
-	atomic_try_cmpxchg(&curr_sched->scx_exit_kind, &none, kind);
+	for_each_online_cpu(i) {
+		sched = cpu_rq(i)->scx.sched[1];
+		if (sched && !strncmp(sched->scx_ops.name, ops->name,
+				      SCX_OPS_NAME_LEN)) {
+			break;
+		}
+	}
 
-	schedule_scx_ops_disable_work(curr_sched);
+	if (sched == NULL) {
+		pr_err("sched_ext: Internal error, disabling not existing "
+		       "scheduler.\n");
+		return;
+	}
+	atomic_try_cmpxchg(&sched->scx_exit_kind, &none, kind);
+
+	schedule_scx_ops_disable_work(sched);
 }
 
 static void dump_newline(struct seq_buf *s)
@@ -5485,7 +5522,6 @@ static int scx_sched_init(struct scx_scheduler *sched, struct task_group *root_g
 	sched->scx_ops_disable_work = (struct kthread_work)
 		KTHREAD_WORK_INIT(sched->scx_ops_disable_work, scx_ops_disable_workfn);
 	sched->scx_ops_error_irq_work = IRQ_WORK_INIT(scx_ops_error_irq_workfn);
-	INIT_DELAYED_WORK(&sched->scx_watchdog_work, scx_watchdog_workfn);
 err:
 	return ret;
 }
@@ -5564,6 +5600,10 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	sched->scx_sched_idx = 1;
 	if ((ret = scx_sched_init(sched, root_group))) {
 		goto err_sched;
+	}
+
+	if (sched_cnt == 0) {
+		INIT_DELAYED_WORK(&scx_watchdog_work, scx_watchdog_workfn);
 	}
 
 	if (!scx_ops_helper) {
@@ -5675,17 +5715,22 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	else
 		timeout = SCX_WATCHDOG_MAX_TIMEOUT;
 
-	if (!READ_ONCE(scx_watchdog_timeout) 
-	    || READ_ONCE(scx_watchdog_timeout) > timeout) {
+	if (sched_cnt == 0) {
 		WRITE_ONCE(scx_watchdog_timeout, timeout);
+		WRITE_ONCE(scx_watchdog_timestamp, jiffies);
+		queue_delayed_work(system_unbound_wq, &scx_watchdog_work,
+				scx_watchdog_timeout / 2);
+	} else if (READ_ONCE(scx_watchdog_timeout) > timeout) {
+		WRITE_ONCE(scx_watchdog_timeout, timeout);
+		WRITE_ONCE(scx_watchdog_timestamp, jiffies);
 		/*
-		 * WARNING: NEED cancel_delayed_work here.
+		 * Need cancel_delayed_work here.
 		 * Or the other scheduler will create another watchdog.
 		 */
+		cancel_delayed_work(&scx_watchdog_work);
+		queue_delayed_work(system_unbound_wq, &scx_watchdog_work,
+				scx_watchdog_timeout / 2);
 	}
-	WRITE_ONCE(scx_watchdog_timestamp, jiffies);
-	queue_delayed_work(system_unbound_wq, &sched->scx_watchdog_work,
-			   scx_watchdog_timeout / 2);
 
 	/*
 	 * Once __scx_ops_enabled is set, %current can be switched to SCX
@@ -5720,8 +5765,10 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	 */
 	percpu_down_write(&scx_fork_rwsem);
 
-	WARN_ON_ONCE(scx_ops_init_task_enabled);
-	scx_ops_init_task_enabled = true;
+	if (sched_cnt == 0) {
+		WARN_ON_ONCE(scx_ops_init_task_enabled);
+		scx_ops_init_task_enabled = true;
+	}
 
 	/*
 	 * Enable ops for every task. Fork is excluded by scx_fork_rwsem
@@ -5741,7 +5788,9 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	if (ret)
 		goto err_disable_unlock_all;
 
-	scx_cgroup_enabled = true;
+	if (sched_cnt == 0) {
+		scx_cgroup_enabled = true;
+	}
 
 	this_cpu_sched = switch_this_cpu_curr_sched(sched);
 	scx_task_iter_start(&sti);
@@ -5788,8 +5837,10 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	 * All tasks are READY. It's safe to turn on scx_enabled() and switch
 	 * all eligible tasks.
 	 */
-	WRITE_ONCE(scx_switching_all, !(ops->flags & SCX_OPS_SWITCH_PARTIAL));
-	static_branch_enable(&__scx_ops_enabled);
+	if (!READ_ONCE(scx_switching_all))
+		WRITE_ONCE(scx_switching_all, !(ops->flags & SCX_OPS_SWITCH_PARTIAL));
+	if (sched_cnt == 0)
+		static_branch_enable(&__scx_ops_enabled);
 
 	/*
 	 * We're fully committed and can't fail. The task READY -> ENABLED
@@ -5848,6 +5899,7 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	// 	struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
 	// 	*cpu_sched = new_curr_sched;
 	// }
+	sched_cnt += 1;
 
 	pr_info("sched_ext: BPF scheduler \"%s\" enabled%s\n",
 		sched->scx_ops.name, scx_switched_all() ? "" : " (partial)");
@@ -6110,7 +6162,7 @@ static int bpf_scx_reg(void *kdata, struct bpf_link *link)
 
 static void bpf_scx_unreg(void *kdata, struct bpf_link *link)
 {
-	scx_ops_disable(SCX_EXIT_UNREG);
+	scx_ops_disable(kdata, SCX_EXIT_UNREG);
 	kthread_flush_work(&curr_sched->scx_ops_disable_work);
 }
 
@@ -6240,7 +6292,7 @@ static struct bpf_struct_ops bpf_sched_ext_ops = {
 static void sysrq_handle_sched_ext_reset(u8 key)
 {
 	if (scx_ops_helper)
-		scx_ops_disable(SCX_EXIT_SYSRQ);
+		scx_ops_disable(NULL, SCX_EXIT_SYSRQ);
 	else
 		pr_info("sched_ext: BPF scheduler not yet used\n");
 }
