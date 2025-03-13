@@ -4712,7 +4712,7 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	if (rt_prio(p->prio)) {
 		p->sched_class = &rt_sched_class;
 #ifdef CONFIG_SCHED_CLASS_EXT
-	} else if (task_should_scx(p->policy)) {
+	} else if (task_should_scx(task_group(p)->sched, p->policy)) {
 		p->sched_class = &ext_sched_class;
 #endif
 	} else {
@@ -7029,7 +7029,8 @@ int default_wake_function(wait_queue_entry_t *curr, unsigned mode, int wake_flag
 }
 EXPORT_SYMBOL(default_wake_function);
 
-const struct sched_class *__setscheduler_class(int policy, int prio)
+const struct sched_class *
+__setscheduler_class(const struct scx_scheduler *sched, int policy, int prio)
 {
 	if (dl_prio(prio))
 		return &dl_sched_class;
@@ -7038,7 +7039,7 @@ const struct sched_class *__setscheduler_class(int policy, int prio)
 		return &rt_sched_class;
 
 #ifdef CONFIG_SCHED_CLASS_EXT
-	if (task_should_scx(policy))
+	if (task_should_scx(sched, policy))
 		return &ext_sched_class;
 #endif
 
@@ -7146,7 +7147,7 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 		queue_flag &= ~DEQUEUE_MOVE;
 
 	prev_class = p->sched_class;
-	next_class = __setscheduler_class(p->policy, prio);
+	next_class = __setscheduler_class(task_group(p)->sched, p->policy, prio);
 
 	if (prev_class != next_class && p->se.sched_delayed)
 		dequeue_task(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED | DEQUEUE_NOCLOCK);
