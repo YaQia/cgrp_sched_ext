@@ -7030,7 +7030,7 @@ int default_wake_function(wait_queue_entry_t *curr, unsigned mode, int wake_flag
 EXPORT_SYMBOL(default_wake_function);
 
 const struct sched_class *
-__setscheduler_class(const struct scx_scheduler *sched, int policy, int prio)
+__setscheduler_class(struct scx_scheduler *const sched, int policy, int prio)
 {
 	if (dl_prio(prio))
 		return &dl_sched_class;
