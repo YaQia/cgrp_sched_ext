@@ -3526,26 +3526,30 @@ void __scx_update_idle(struct rq *rq, struct task_struct *p, bool idle)
 static void handle_hotplug(struct rq *rq, bool online)
 {
 	int cpu = cpu_of(rq);
-	struct scx_scheduler *sched = rq->scx.sched[1];
+	int i;
+	for (i = SCHED_MAX_IDX; i >= 0; i--) {
+		struct scx_scheduler *sched = rq->scx.sched[i];
 
-	atomic_long_inc(&scx_hotplug_seq);
+		atomic_long_inc(&scx_hotplug_seq);
 
-	if (!scx_enabled() || !sched)
-		return;
+		if (!scx_enabled() || !sched)
+			return;
 
-	/* This is impossible. */
-	// if (!cpumask_test_cpu(cpu, curr_sched->avail_masks)) {}
+		/* This is impossible. */
+		// if (!cpumask_test_cpu(cpu, curr_sched->avail_masks)) {}
 
-	if (online && SCX_SCHED_HAS_OP(sched, cpu_online)) {
-		switch_this_cpu_curr_sched(sched);
-		SCX_CALL_OP(SCX_KF_UNLOCKED, cpu_online, cpu);
-	} else if (!online && SCX_SCHED_HAS_OP(sched, cpu_offline)) {
-		switch_this_cpu_curr_sched(sched);
-		SCX_CALL_OP(SCX_KF_UNLOCKED, cpu_offline, cpu);
-	} else {
-		scx_ops_exit(SCX_ECODE_ACT_RESTART | SCX_ECODE_RSN_HOTPLUG,
-			     "cpu %d going %s, exiting scheduler", cpu,
-			     online ? "online" : "offline");
+		if (online && SCX_SCHED_HAS_OP(sched, cpu_online)) {
+			switch_this_cpu_curr_sched(sched);
+			SCX_CALL_OP(SCX_KF_UNLOCKED, cpu_online, cpu);
+		} else if (!online && SCX_SCHED_HAS_OP(sched, cpu_offline)) {
+			switch_this_cpu_curr_sched(sched);
+			SCX_CALL_OP(SCX_KF_UNLOCKED, cpu_offline, cpu);
+		} else {
+			scx_ops_exit(SCX_ECODE_ACT_RESTART 
+				     | SCX_ECODE_RSN_HOTPLUG,
+				     "cpu %d going %s, exiting scheduler",
+				     cpu, online ? "online" : "offline");
+		}
 	}
 }
 
@@ -3609,6 +3613,8 @@ static void scx_watchdog_workfn(struct work_struct *work)
 	int cpu;
 
 	WRITE_ONCE(scx_watchdog_timestamp, jiffies);
+
+	pr_info("sched_ext: in scx_watchdog_workfn\n");
 
 	for_each_online_cpu(cpu) {
 		if (unlikely(check_rq_for_timeouts(cpu_rq(cpu))))
@@ -4858,7 +4864,6 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	if (sched == &dummy_sched)
 		goto done;
 
-	switch_this_cpu_curr_sched(sched);
 	switch (scx_ops_set_enable_state(sched, SCX_OPS_DISABLING)) {
 	case SCX_OPS_DISABLING:
 		WARN_ONCE(true, "sched_ext: duplicate disabling instance?");
@@ -4907,13 +4912,12 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 
 	scx_task_iter_start(&sti);
 	while ((p = scx_task_iter_next_locked(&sti))) {
-		if (sched_cnt > 1) {
-			struct scx_scheduler *const task_sched = 
-						    task_group(p)->sched;
-			if (task_sched != sched)
-				continue;
-		}
-
+		// if (sched_cnt > 1) {
+		// 	struct scx_scheduler *const task_sched = 
+		// 				    task_group(p)->sched;
+		// 	if (task_sched != sched)
+		// 		continue;
+		// }
 		const struct sched_class *old_class = p->sched_class;
 		const struct sched_class *new_class =
 			__setscheduler_class(sched, p->policy, p->prio);
@@ -4938,20 +4942,26 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	percpu_up_write(&scx_fork_rwsem);
 
 	/* change the task_group->sched after tasks are disabled. */
+	scx_cgroup_lock();
 	struct cgroup_subsys_state *css;
 	rcu_read_lock();
 	css_for_each_descendant_post(css, &sched->root_tsk_grp->css) {
 		struct task_group *tg = css_tg(css);
 		tg->sched = &dummy_sched;
-		css_put(css);
 	}
 	rcu_read_unlock();
+	scx_cgroup_unlock();
 
 	for_each_cpu(i, sched->avail_mask) {
-		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
 		struct rq *curr_rq = cpu_rq(i);
-		*cpu_sched = &dummy_sched;
 		curr_rq->scx.sched[sched->scx_sched_idx] = NULL;
+		if (sched->scx_sched_idx == 1 
+		    && curr_rq->scx.sched[0] != &dummy_sched) {
+			struct scx_scheduler *sched = curr_rq->scx.sched[0];
+			sched->scx_sched_idx = 1;
+			curr_rq->scx.sched[1] = sched;
+			curr_rq->scx.sched[0] = &dummy_sched;
+		}
 		// bool need_change = false, deleted = false;
 		// if (*cpu_sched == sched) {
 		// 	need_change = true;
@@ -5086,9 +5096,11 @@ static void scx_ops_disable(struct scx_scheduler *sched, enum scx_exit_kind kind
 		while (true) {
 			for_each_online_cpu(i) {
 				sched = cpu_rq(i)->scx.sched[1];
-				if (sched) {
+				if (sched)
 					break;
-				}
+				sched = cpu_rq(i)->scx.sched[0];
+				if (sched && sched != &dummy_sched)
+					break;
 			}
 			if (!sched)
 				break;
@@ -5511,15 +5523,18 @@ static int scx_sched_init(struct scx_scheduler *const sched, struct task_group *
 	cpumask_copy(sched->avail_mask, cs->effective_cpus);
 
 	for_each_cpu(i, sched->avail_mask) {
-		struct scx_scheduler **cpu_sched = per_cpu_ptr(&_curr_sched, i);
-		if (sched != &dummy_sched && *cpu_sched != &dummy_sched) {
+		struct rq *curr_rq = cpu_rq(i);
+		if (sched != &dummy_sched && curr_rq->scx.sched[0] != &dummy_sched) {
 			free_cpumask_var(sched->avail_mask);
-			pr_err("sched_ext: Multiple schedulers in one core is not supported\n");
+			pr_err("sched_ext: More than 2 schedulers in one core "
+			       "is not supported\n");
 			ret = -EINVAL;
 			goto err;
+		} else if (sched != &dummy_sched && curr_rq->scx.sched[1] == NULL) {
+			sched->scx_sched_idx = 1;
+		} else {
+			sched->scx_sched_idx = 0;
 		}
-		struct rq *curr_rq = cpu_rq(i);
-		*cpu_sched = sched;
 		curr_rq->scx.sched[sched->scx_sched_idx] = sched;
 	}
 #endif
@@ -5641,8 +5656,6 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 		goto err_unlock;
 	}
 
-	/* Any scheduler enabled by user idx is 1. */
-	sched->scx_sched_idx = 1;
 	if ((ret = scx_sched_init(sched, root_group))) {
 		goto err_sched;
 	}
@@ -6189,14 +6202,15 @@ static int bpf_scx_reg(void *kdata, struct bpf_link *link)
 
 static void bpf_scx_unreg(void *kdata, struct bpf_link *link)
 {
-	int i;
+	int i, j;
 	struct sched_ext_ops *ops = kdata;
 	struct scx_scheduler *sched;
 	for_each_online_cpu(i) {
-		sched = cpu_rq(i)->scx.sched[1];
-		if (sched && !strncmp(sched->scx_ops.name, ops->name,
-				      SCX_OPS_NAME_LEN)) {
-			break;
+		for (j = SCHED_MAX_IDX; j >= 0; j--) {
+			sched = cpu_rq(i)->scx.sched[j];
+			if (sched && !strncmp(sched->scx_ops.name, ops->name,
+						SCX_OPS_NAME_LEN))
+				goto disable;
 		}
 	}
 
@@ -6205,6 +6219,7 @@ static void bpf_scx_unreg(void *kdata, struct bpf_link *link)
 		       "scheduler.\n");
 		return;
 	}
+disable:
 	scx_ops_disable(sched, SCX_EXIT_UNREG);
 	kthread_flush_work(&sched->scx_ops_disable_work);
 }
@@ -6569,7 +6584,8 @@ void __init init_sched_ext_class(void)
 
 	for_each_possible_cpu(cpu) {
 		struct rq *rq = cpu_rq(cpu);
-
+		rq->scx.sched[0] = NULL;
+		rq->scx.sched[1] = NULL;
 		init_dsq(&rq->scx.local_dsq[0], SCX_DSQ_LOCAL);
 		init_dsq(&rq->scx.local_dsq[1], SCX_DSQ_LOCAL);
 		INIT_LIST_HEAD(&rq->scx.runnable_list);
