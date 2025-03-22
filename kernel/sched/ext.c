@@ -3182,7 +3182,7 @@ static struct task_struct *pick_task_scx(struct rq *rq)
 		}
 	} else if (unlikely(keep_prev && !prev_on_scx)) {
 		/* only allowed during transitions */
-		WARN_ON_ONCE(scx_ops_enable_state(curr_sched)
+		WARN_ON_ONCE(scx_ops_enable_state(task_group(prev)->sched) 
 			     == SCX_OPS_ENABLED);
 		keep_prev = false;
 	}
@@ -4823,7 +4823,7 @@ static const char *scx_exit_reason(enum scx_exit_kind kind)
 
 static void scx_ops_disable_workfn(struct kthread_work *work)
 {
-	struct scx_scheduler *const sched = 
+	struct scx_scheduler *sched = 
 		container_of(work, struct scx_scheduler, scx_ops_disable_work);
 	// struct scx_sched_prio *prio = container_of(sched, struct scx_sched_prio, sched);
 	struct scx_exit_info *ei = sched->scx_exit_info;
@@ -4856,6 +4856,7 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	if (sched == &dummy_sched)
 		goto done;
 
+again:
 	switch (scx_ops_set_enable_state(sched, SCX_OPS_DISABLING)) {
 	case SCX_OPS_DISABLING:
 		WARN_ONCE(true, "sched_ext: duplicate disabling instance?");
@@ -4868,22 +4869,6 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 		goto done;
 	default:
 		break;
-	}
-
-	if (sched_cnt == 1) {
-		switch (scx_ops_set_enable_state(&dummy_sched, SCX_OPS_DISABLING)) {
-		case SCX_OPS_DISABLING:
-			WARN_ONCE(true, "sched_ext: duplicate disabling instance?");
-			break;
-		case SCX_OPS_DISABLED:
-			pr_warn("sched_ext: ops error detected without ops (%s)\n",
-				sched->scx_exit_info->msg);
-			WARN_ON_ONCE(scx_ops_set_enable_state(sched, SCX_OPS_DISABLED)
-				     != SCX_OPS_DISABLING);
-			goto done;
-		default:
-			break;
-		}
 	}
 
 	/*
@@ -4904,9 +4889,6 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	 */
 	scx_cgroup_lock();
 	scx_cgroup_exit(sched);
-	if (sched_cnt == 1) {
-		scx_cgroup_exit(&dummy_sched);
-	}
 	scx_cgroup_unlock();
 
 	/*
@@ -4997,7 +4979,6 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 		// 	}
 		// }
 	}
-	pr_info("disable_workfn: after rq scheduler changed.\n");
 
 	/* no task is on scx, turn off all the switches and flush in-progress calls */
 	if (sched_cnt == 1)
@@ -5009,7 +4990,6 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	sched->scx_ops_cpu_preempt = false;
 	sched->scx_builtin_idle_enabled = false;
 	synchronize_rcu();
-	pr_info("disable_workfn: after synchronize_rcu.\n");
 
 	if (ei->kind >= SCX_EXIT_ERROR) {
 		pr_err("sched_ext: BPF scheduler \"%s\" disabled (%s)\n",
@@ -5033,7 +5013,6 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	if (sched_cnt == 1)
 		cancel_delayed_work_sync(&scx_watchdog_work);
 
-	pr_info("disable_workfn: after cancel_delayed_work_sync.\n");
 	/*
 	 * Delete the kobject from the hierarchy eagerly in addition to just
 	 * dropping a reference. Otherwise, if the object is deleted
@@ -5043,7 +5022,6 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	kobject_del(sched->scx_root_kobj);
 	kobject_put(sched->scx_root_kobj);
 	sched->scx_root_kobj = NULL;
-	pr_info("disable_workfn: after delete kobj.\n");
 
 	memset(&sched->scx_ops, 0, sizeof(sched->scx_ops));
 
@@ -5057,7 +5035,6 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 		rhashtable_walk_stop(&rht_iter);
 	} while (dsq == ERR_PTR(-EAGAIN));
 	rhashtable_walk_exit(&rht_iter);
-	pr_info("disable_workfn: after free dsqs.\n");
 
 	if (sched_cnt == 1) {
 		free_percpu(scx_dsp_ctx);
@@ -5079,35 +5056,19 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 	free_cpumask_var(sched->avail_mask);
 	free_cpumask_var(sched->idle_mask_cpu);
 	free_cpumask_var(sched->idle_mask_smt);
-	if (sched_cnt == 1) {
-		free_exit_info(dummy_sched.scx_exit_info);
-		dummy_sched.scx_exit_info = NULL;
-
-		for_each_node_state(node, N_POSSIBLE) {
-			if (dummy_sched.global_dsqs[node]) {
-				kfree(dummy_sched.global_dsqs[node]);
-			}
-		}
-		kfree(dummy_sched.global_dsqs);
-		free_cpumask_var(dummy_sched.avail_mask);
-		free_cpumask_var(dummy_sched.idle_mask_cpu);
-		free_cpumask_var(dummy_sched.idle_mask_smt);
-	}
-	pr_info("disable_workfn: after kfree all sched fields.\n");
-
 	WARN_ON_ONCE(scx_ops_set_enable_state(sched, SCX_OPS_DISABLED) !=
 		     SCX_OPS_DISABLING);
-
-	if (sched_cnt == 1)
-		WARN_ON_ONCE(scx_ops_set_enable_state(&dummy_sched, SCX_OPS_DISABLED) !=
-			     SCX_OPS_DISABLING);
+	sched_cnt = sched_cnt ? sched_cnt - 1 : 0;
+	if (sched_cnt == 0 && sched != &dummy_sched) {
+		sched = &dummy_sched;
+		goto again;
+	}
+	sched = container_of(work, struct scx_scheduler, scx_ops_disable_work);
 	kfree(sched);
-	sched_cnt -= 1;
 
 	mutex_unlock(&scx_ops_enable_mutex);
 done:
 	scx_ops_bypass(false);
-	pr_info("sched_ext: disable_workfn finished.\n");
 }
 
 /*static DEFINE_KTHREAD_WORK(scx_ops_disable_work, scx_ops_disable_workfn);*/
