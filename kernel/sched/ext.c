@@ -5061,6 +5061,7 @@ again:
 	sched_cnt = sched_cnt ? sched_cnt - 1 : 0;
 	if (sched_cnt == 0 && sched != &dummy_sched) {
 		sched = &dummy_sched;
+		mutex_unlock(&scx_ops_enable_mutex);
 		goto again;
 	}
 	sched = container_of(work, struct scx_scheduler, scx_ops_disable_work);
@@ -5593,10 +5594,12 @@ err_clear_rq:
 	for_each_cpu(i, sched->avail_mask) {
 		struct rq *curr_rq = cpu_rq(i);
 		raw_spin_rq_lock(curr_rq);
-		if (curr_rq->scx.sched[1] == sched)
+		if (curr_rq->scx.sched[1] == sched) {
 			curr_rq->scx.sched[1] = NULL;
-		else
+		} else {
+			raw_spin_rq_unlock(curr_rq);
 			break;
+		}
 		raw_spin_rq_unlock(curr_rq);
 	}
 err:
@@ -5904,6 +5907,39 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 		scx_cgroup_enabled = true;
 	}
 
+	if (sched_cnt >= 1) {
+		// exit all process from the target task_group first
+		scx_task_iter_start(&sti);
+		while ((p = scx_task_iter_next_locked(&sti))) {
+			const struct sched_class *old_class = p->sched_class;
+			const struct sched_class *new_class =
+				__setscheduler_class(NULL, p->policy, p->prio);
+			struct sched_enq_and_set_ctx ctx;
+
+			struct scx_scheduler *p_sched = task_group(p)->sched;
+			if (p_sched != sched)
+				continue;
+			else
+				task_group(p)->sched = &dummy_sched;
+			if (old_class != new_class && p->se.sched_delayed)
+				dequeue_task(task_rq(p), p,
+					     DEQUEUE_SLEEP | DEQUEUE_DELAYED);
+
+			sched_deq_and_put_task(p, DEQUEUE_SAVE | DEQUEUE_MOVE,
+					       &ctx);
+
+			p->sched_class = new_class;
+			check_class_changing(task_rq(p), p, old_class);
+
+			sched_enq_and_set_task(&ctx);
+
+			check_class_changed(task_rq(p), p, old_class, p->prio);
+			scx_ops_exit_task(p);
+			task_group(p)->sched = p_sched;
+		}
+		scx_task_iter_stop(&sti);
+	}
+
 	scx_task_iter_start(&sti);
 	while ((p = scx_task_iter_next_locked(&sti))) {
 		/*
@@ -5921,18 +5957,6 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 
 		scx_task_iter_unlock(&sti);
 		
-		/*
-		 * If multiple schedulers are set here, then those tasks should 
-		 * be scheduled by this scheduler is now in dummy_sched, we need
-		 * to exit it from dummy_sched here.
-		 */
-		if (sched_cnt >= 1) {
-			struct rq *p_rq;
-			struct rq_flags rf;
-			p_rq = task_rq_lock(p, &rf);
-			scx_ops_exit_task(p);
-			task_rq_unlock(p_rq, p, &rf);
-		}
 		ret = scx_ops_init_task(p, task_group(p), false);
 		if (ret) {
 			put_task_struct(p);
