@@ -5115,6 +5115,9 @@ again:
 	if (sched_cnt == 1 && sched != &dummy_sched) {
 		sched = &dummy_sched;
 		mutex_unlock(&scx_ops_enable_mutex);
+		ei = sched->scx_exit_info;
+		ei->kind = kind;
+		ei->reason = scx_exit_reason(ei->kind);
 		goto again;
 	}
 
