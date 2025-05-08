@@ -5580,21 +5580,21 @@ static int scx_sched_init(struct scx_scheduler *const sched, struct task_group *
 	cpumask_copy(sched->avail_mask, cs->effective_cpus);
 
 	for_each_cpu(i, sched->avail_mask) {
-		struct rq *curr_rq = cpu_rq(i);
-		raw_spin_rq_lock(curr_rq);
-		if (sched != &dummy_sched && curr_rq->scx.sched[1] != NULL) {
+		struct rq *rq = cpu_rq(i);
+		raw_spin_rq_lock(rq);
+		if (sched != &dummy_sched && rq->scx.sched[1] != NULL) {
 			pr_err("sched_ext: 2 schedulers in one core "
 			       "is not supported currently.\n");
 			ret = -EINVAL;
-			raw_spin_rq_unlock(curr_rq);
+			raw_spin_rq_unlock(rq);
 			goto err_clear_rq;
 		} else if (sched != &dummy_sched) {
 			sched->scx_sched_idx = 1;
 		} else {
 			sched->scx_sched_idx = 0;
 		}
-		curr_rq->scx.sched[sched->scx_sched_idx] = sched;
-		raw_spin_rq_unlock(curr_rq);
+		rq->scx.sched[sched->scx_sched_idx] = sched;
+		raw_spin_rq_unlock(rq);
 	}
 #endif
 
@@ -5643,15 +5643,15 @@ static int scx_sched_init(struct scx_scheduler *const sched, struct task_group *
 	return ret;
 err_clear_rq:
 	for_each_cpu(i, sched->avail_mask) {
-		struct rq *curr_rq = cpu_rq(i);
-		raw_spin_rq_lock(curr_rq);
-		if (curr_rq->scx.sched[1] == sched) {
-			curr_rq->scx.sched[1] = NULL;
+		struct rq *rq = cpu_rq(i);
+		raw_spin_rq_lock(rq);
+		if (rq->scx.sched[1] == sched) {
+			rq->scx.sched[1] = NULL;
 		} else {
-			raw_spin_rq_unlock(curr_rq);
+			raw_spin_rq_unlock(rq);
 			break;
 		}
-		raw_spin_rq_unlock(curr_rq);
+		raw_spin_rq_unlock(rq);
 	}
 err:
 	free_cpumask_var(sched->avail_mask);
@@ -5682,17 +5682,17 @@ static int scx_ops_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 		strcpy(sched->scx_ops.name, "dummy");
 	}
 	
+	struct cgroup* root_cg = cgroup_get_from_path(ops->root_cgroup_path);
+	if (IS_ERR(root_cg)) {
+		pr_err("sched_ext: Invalid root_cgroup_path\n");
+		ret = PTR_ERR(root_cg);
+		goto err_unlock;
+	}
 again:
 	if (!sched_cnt || !strcmp(ops->root_cgroup_path, "")) {
 		pr_info("sched_ext: use root_task_group as root_group\n");
 		root_group = &root_task_group;
 	} else {
-		struct cgroup* root_cg = cgroup_get_from_path(ops->root_cgroup_path);
-		if (IS_ERR(root_cg)) {
-			pr_err("sched_ext: Invalid root_cgroup_path\n");
-			ret = PTR_ERR(root_cg);
-			goto err_unlock;
-		}
 		root_group = css_tg(root_cg->subsys[cpu_cgrp_id]);
 	}
 
