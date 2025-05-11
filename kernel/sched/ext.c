@@ -927,7 +927,7 @@ static unsigned long scx_watchdog_timestamp = INITIAL_JIFFIES;
 struct scx_scheduler {
 	/* root task group for this scheduler */
 	struct task_group	*root_tsk_grp;
-	struct kobject		*scx_root_kobj;
+	struct kobject		scx_root_kobj;
 	struct sched_ext_ops	scx_ops;
 	cpumask_var_t		avail_mask CL_ALIGNED_IF_ONSTACK;
 	/*
@@ -971,12 +971,13 @@ static DEFINE_PER_CPU(struct scx_scheduler *, _curr_sched) = NULL;
 static __always_inline struct scx_scheduler *get_curr_sched(void)
 {
 	struct scx_scheduler *sched = this_cpu_read(_curr_sched);
-	// if (unlikely(!sched)) {
-	// 	pr_err("Current scheduler is not initialized "
-	// 	       "for CPU %d\n", smp_processor_id());
-	// 	this_cpu_write(_curr_sched, &dummy_sched);
-	// 	sched = &dummy_sched;
-	// }
+	if (unlikely(!sched)) {
+		pr_err("Current scheduler is not initialized "
+		       "for CPU %d\n", smp_processor_id());
+		this_cpu_write(_curr_sched, &dummy_sched);
+		sched = &dummy_sched;
+	}
+	// BUG_ON(unlikely(!sched));
 	return sched;
 }
 
@@ -1583,7 +1584,7 @@ static struct task_struct *scx_task_iter_next_locked(struct scx_task_iter *iter)
 }
 
 static enum scx_ops_enable_state 
-scx_ops_enable_state(struct scx_scheduler *const sched)
+scx_ops_enable_state(const struct scx_scheduler *const sched)
 {
 	return atomic_read(&sched->scx_ops_enable_state_var);
 }
@@ -3206,8 +3207,13 @@ static struct task_struct *pick_task_scx(struct rq *rq)
 				break;
 		}
 		if (!p) {
-			if (kick_idle)
+			if (kick_idle) {
+				// to avoid ops_cpu_valid called with random schedulers
+				switch_this_cpu_curr_sched(&dummy_sched);
+				// struct scx_scheduler *sched = switch_this_cpu_curr_sched(&dummy_sched);
 				scx_bpf_kick_cpu(cpu_of(rq), SCX_KICK_IDLE);
+				// switch_this_cpu_curr_sched(sched);
+			}
 			return NULL;
 		}
 
@@ -4556,15 +4562,18 @@ static int scx_cgroup_init(void) { return 0; }
 		.show = scx_attr_##_name##_show,				\
 	}
 
-/*
- * TODO: check what this kobj is.
- */
 static ssize_t scx_attr_state_show(struct kobject *kobj,
 				   struct kobj_attribute *ka, char *buf)
 {
+	if (unlikely(sched_cnt == 0)) 
+		return sysfs_emit(buf, "%s\n", 
+				  scx_ops_enable_state_str[SCX_OPS_DISABLED]);
+
+	const struct scx_scheduler *sched = 
+		container_of(kobj, struct scx_scheduler, scx_root_kobj);
 	return sysfs_emit(buf, "%s\n",
 			  scx_ops_enable_state_str
-			  [scx_ops_enable_state(curr_sched)]);
+			  [scx_ops_enable_state(sched)]);
 }
 SCX_ATTR(state);
 
@@ -4611,16 +4620,22 @@ static const struct attribute_group scx_global_attr_group = {
 
 static void scx_kobj_release(struct kobject *kobj)
 {
-	kfree(kobj);
+	/*
+	 * dummy kobject needs to be reuse
+	 * so we manually set its state to uninitialized
+	 */
+	kobj->state_initialized = 0;
+	// kfree(kobj);
 }
 
-/*
- * TODO: check what this kobj is.
- */
 static ssize_t scx_attr_ops_show(struct kobject *kobj,
 				 struct kobj_attribute *ka, char *buf)
 {
-	return sysfs_emit(buf, "%s\n", curr_sched->scx_ops.name);
+	if (unlikely(sched_cnt == 0))
+		return 0;
+	const struct scx_scheduler *sched = 
+		container_of(kobj, struct scx_scheduler, scx_root_kobj);
+	return sysfs_emit(buf, "%s\n", sched->scx_ops.name);
 }
 SCX_ATTR(ops);
 
@@ -4641,7 +4656,9 @@ static const struct kobj_type scx_ktype = {
  */
 static int scx_uevent(const struct kobject *kobj, struct kobj_uevent_env *env)
 {
-	return add_uevent_var(env, "SCXOPS=%s", curr_sched->scx_ops.name);
+	const struct scx_scheduler *const sched = 
+		container_of(kobj, struct scx_scheduler, scx_root_kobj);
+	return add_uevent_var(env, "SCXOPS=%s", sched->scx_ops.name);
 }
 
 static const struct kset_uevent_ops scx_uevent_ops = {
@@ -5069,9 +5086,8 @@ again:
 	 * asynchronously, sysfs could observe an object of the same name still
 	 * in the hierarchy when another scheduler is loaded.
 	 */
-	kobject_del(sched->scx_root_kobj);
-	kobject_put(sched->scx_root_kobj);
-	sched->scx_root_kobj = NULL;
+	kobject_del(&sched->scx_root_kobj);
+	kobject_put(&sched->scx_root_kobj);
 
 	memset(&sched->scx_ops, 0, sizeof(sched->scx_ops));
 
@@ -5721,19 +5737,12 @@ again:
 		goto err_sched;
 	}
 
-	sched->scx_root_kobj = kzalloc(sizeof(struct kobject),
-				       GFP_KERNEL);
-	if (!sched->scx_root_kobj) {
-		ret = -ENOMEM;
-		goto err_sched;
-	}
-
-	sched->scx_root_kobj->kset = scx_kset;
+	sched->scx_root_kobj.kset = scx_kset;
 	if (sched != &dummy_sched)
-		ret = kobject_init_and_add(sched->scx_root_kobj, 
+		ret = kobject_init_and_add(&sched->scx_root_kobj, 
 					   &scx_ktype, NULL, ops->name);
 	else
-		ret = kobject_init_and_add(sched->scx_root_kobj, 
+		ret = kobject_init_and_add(&sched->scx_root_kobj, 
 					   &scx_ktype, NULL, "dummy");
 	if (ret < 0)
 		goto err;
@@ -6064,9 +6073,9 @@ again:
 		sched->scx_ops.name, scx_switched_all() ? "" : " (partial)");
 	if (sched_cnt == 1)
 		goto again;
-	kobject_uevent(sched->scx_root_kobj, KOBJ_ADD);
+	kobject_uevent(&sched->scx_root_kobj, KOBJ_ADD);
 	if (sched_cnt == 2)
-		kobject_uevent(dummy_sched.scx_root_kobj, KOBJ_ADD);
+		kobject_uevent(&dummy_sched.scx_root_kobj, KOBJ_ADD);
 	mutex_unlock(&scx_ops_enable_mutex);
 
 	atomic_long_inc(&scx_enable_seq);
@@ -6074,10 +6083,9 @@ again:
 	return 0;
 
 err_del:
-	kobject_del(sched->scx_root_kobj);
+	kobject_del(&sched->scx_root_kobj);
 err:
-	kobject_put(sched->scx_root_kobj);
-	sched->scx_root_kobj = NULL;
+	kobject_put(&sched->scx_root_kobj);
 	if (sched->scx_exit_info) {
 		free_exit_info(sched->scx_exit_info);
 		sched->scx_exit_info = NULL;
