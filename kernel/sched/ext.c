@@ -971,12 +971,6 @@ static DEFINE_PER_CPU(struct scx_scheduler *, _curr_sched) = NULL;
 static __always_inline struct scx_scheduler *get_curr_sched(void)
 {
 	struct scx_scheduler *sched = this_cpu_read(_curr_sched);
-	if (unlikely(!sched)) {
-		pr_err("Current scheduler is not initialized "
-		       "for CPU %d\n", smp_processor_id());
-		this_cpu_write(_curr_sched, &dummy_sched);
-		sched = &dummy_sched;
-	}
 	// BUG_ON(unlikely(!sched));
 	return sched;
 }
