@@ -665,8 +665,12 @@ retry:
 	if (ret)
 		return ret;
 
+	u64 start_block = ktime_get_ns();
 	/* futex_queue and wait for wakeup, timeout, or a signal. */
 	futex_wait_queue(hb, &q, to);
+	u64 end_block = ktime_get_ns();
+	u64 pre_total_block_ns = atomic64_read(&current->futex_total_block_ns);
+	atomic64_set(&current->futex_total_block_ns, (end_block - start_block) / 2 + pre_total_block_ns / 2);
 
 	/* If we were woken (and unqueued), we succeeded, whatever. */
 	if (!futex_unqueue(&q))
