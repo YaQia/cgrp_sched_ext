@@ -184,6 +184,7 @@ struct futex_q {
 #ifdef CONFIG_PREEMPT_RT
 	struct rcuwait requeue_wait;
 #endif
+	atomic64_t last_wake_ns;
 } __randomize_layout;
 
 extern const struct futex_q futex_q_init;

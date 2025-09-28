@@ -557,10 +557,11 @@ void futex_q_unlock(struct futex_hash_bucket *hb)
 static inline int calculate_dynamic_prio(void)
 {
     u64 total_block_time = atomic64_read(&current->futex_total_block_ns);
-    // 范围：[0, 64]
-    int level = fls64(total_block_time / NSEC_PER_MSEC);
+    // log2(2^64/NSEC_PER_MSEC) = 44
+    // 范围：[0, 44]
+    int level = 44 - fls64(total_block_time / NSEC_PER_MSEC);
 
-    // 将处理后的时间映射到 [100, 164] 区间
+    // 将处理后的时间映射到 [100, 144] 区间
     // 注意：数值越小，plist优先级越高。所以阻塞时间最长的任务应该得到最小的数值。
     return MAX_RT_PRIO + level;
 }
@@ -582,7 +583,7 @@ void __futex_queue(struct futex_q *q, struct futex_hash_bucket *hb)
 	 * INT_MIN to INT_MAX, so we don't need to worry about the 
 	 * PRIO should be 0-100 like before futex implementation.
 	 */
-	if (rt_task(current)) {
+	if (rt_or_dl_task(current)) {
 		prio = current->normal_prio;
 	} else {
 		prio = calculate_dynamic_prio();
