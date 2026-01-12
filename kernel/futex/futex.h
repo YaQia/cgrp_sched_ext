@@ -2,6 +2,7 @@
 #ifndef _FUTEX_H
 #define _FUTEX_H
 
+#include <linux/timekeeping.h>
 #include <linux/futex.h>
 #include <linux/rtmutex.h>
 #include <linux/sched/wake_q.h>
@@ -116,6 +117,7 @@ struct futex_hash_bucket {
 	atomic_t waiters;
 	spinlock_t lock;
 	struct plist_head chain;
+	atomic64_t start_ns;
 } ____cacheline_aligned_in_smp;
 
 /*
@@ -184,7 +186,7 @@ struct futex_q {
 #ifdef CONFIG_PREEMPT_RT
 	struct rcuwait requeue_wait;
 #endif
-	atomic64_t last_wake_ns;
+	u64 start_block_ns;
 } __randomize_layout;
 
 extern const struct futex_q futex_q_init;
@@ -263,7 +265,9 @@ extern void wait_for_owner_exiting(int ret, struct task_struct *exiting);
 static inline void futex_hb_waiters_inc(struct futex_hash_bucket *hb)
 {
 #ifdef CONFIG_SMP
-	atomic_inc(&hb->waiters);
+	if (unlikely(atomic_inc_return(&hb->waiters) == 1)) {
+		atomic64_set(&hb->start_ns, ktime_get_ns());
+	}
 	/*
 	 * Full barrier (A), see the ordering comment above.
 	 */

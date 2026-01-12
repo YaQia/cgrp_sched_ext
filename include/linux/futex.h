@@ -4,6 +4,7 @@
 
 #include <linux/sched.h>
 #include <linux/ktime.h>
+#include <linux/types.h>
 
 #include <uapi/linux/futex.h>
 
@@ -69,6 +70,7 @@ static inline void futex_init_task(struct task_struct *tsk)
 	tsk->pi_state_cache = NULL;
 	tsk->futex_state = FUTEX_STATE_OK;
 	mutex_init(&tsk->futex_exit_mutex);
+	atomic64_set(&tsk->futex_total_block_ns, 0);
 }
 
 void futex_exit_recursive(struct task_struct *tsk);

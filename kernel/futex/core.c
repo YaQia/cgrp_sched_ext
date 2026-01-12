@@ -31,6 +31,7 @@
  *  "The futexes are also cursed."
  *  "But they come in a choice of three flavours!"
  */
+#include <linux/timekeeping.h>
 #include <linux/compat.h>
 #include <linux/jhash.h>
 #include <linux/pagemap.h>
@@ -554,16 +555,20 @@ void futex_q_unlock(struct futex_hash_bucket *hb)
 	futex_hb_waiters_dec(hb);
 }
 
-static inline int calculate_dynamic_prio(void)
+static inline int calculate_dynamic_prio(atomic64_t *hb_start_ns)
 {
-    u64 total_block_time = atomic64_read(&current->futex_total_block_ns);
-    // log2(2^64/NSEC_PER_MSEC) = 44
-    // 范围：[0, 44]
-    int level = 44 - fls64(total_block_time / NSEC_PER_MSEC);
+	u64 current_ns = ktime_get_ns();
+	u64 block_ns = atomic64_read(&current->futex_total_block_ns);
+	u64 start_ns = atomic64_read(hb_start_ns);
+	s64 block_ns_diff = block_ns - (current_ns - start_ns);
 
-    // 将处理后的时间映射到 [100, 144] 区间
-    // 注意：数值越小，plist优先级越高。所以阻塞时间最长的任务应该得到最小的数值。
-    return MAX_RT_PRIO + level;
+	s32 prio;
+	if (block_ns_diff >= 0)
+		prio = 64 - fls64(block_ns_diff);
+	else
+		prio = 64 + fls64(-block_ns_diff);
+
+	return MAX_RT_PRIO + prio;
 }
 
 void __futex_queue(struct futex_q *q, struct futex_hash_bucket *hb)
@@ -581,14 +586,13 @@ void __futex_queue(struct futex_q *q, struct futex_hash_bucket *hb)
 	/*
 	 * Currently, plist's implementation can accept any prio from
 	 * INT_MIN to INT_MAX, so we don't need to worry about the 
-	 * PRIO should be 0-100 like before futex implementation.
+	 * PRIO should be 0-100 like previous futex implementation.
 	 */
 	if (rt_or_dl_task(current)) {
 		prio = current->normal_prio;
 	} else {
-		prio = calculate_dynamic_prio();
+		prio = calculate_dynamic_prio(&hb->start_ns);
 	}
-	// prio = min(current->normal_prio, MAX_RT_PRIO);
 
 	plist_node_init(&q->list, prio);
 	plist_add(&q->list, &hb->chain);
@@ -1189,6 +1193,7 @@ static int __init futex_init(void)
 		atomic_set(&futex_queues[i].waiters, 0);
 		plist_head_init(&futex_queues[i].chain);
 		spin_lock_init(&futex_queues[i].lock);
+		atomic64_set(&futex_queues[i].start_ns, 0);
 	}
 
 	return 0;

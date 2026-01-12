@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <linux/delay.h>
 #include <linux/plist.h>
-#include <linux/sched.h>
 #include <linux/sched/task.h>
 #include <linux/sched/signal.h>
 #include <linux/freezer.h>
@@ -160,7 +160,14 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 	union futex_key key = FUTEX_KEY_INIT;
 	DEFINE_WAKE_Q(wake_q);
 	int ret;
-	bool need_sleep = false;
+	u64 target_total_block_ns;
+	u64 now = ktime_get_ns();
+#ifdef CONFIG_SMP
+	struct task_struct *target_task;
+	bool need_switch = false;
+#endif
+
+	atomic64_set(&current->futex_total_block_ns, 0);
 
 	if (!bitset)
 		return -EINVAL;
@@ -192,17 +199,22 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 				continue;
 
 			this->wake(&wake_q, this);
-			atomic64_set(&this->last_wake_ns, ktime_get_ns());
 			ret++;
-			
-			/**
-			 * if the task has longest block time is waiting too long,
+
+			target_total_block_ns = atomic64_read(&this->task->futex_total_block_ns)
+						+ now - this->start_block_ns;
+
+			atomic64_set(&this->task->futex_total_block_ns, target_total_block_ns);
+#ifdef CONFIG_SMP
+			/*
+			 * If the task has the longest block time is waiting too long,
 			 * we should reschedule this task.
-			 **/
-			if (ret == 1 && atomic64_read(&this->task->futex_total_block_ns) >= HZ_TO_NSEC_NUM) {
-				set_tsk_need_resched(current);
-				need_sleep = true;
+			 */
+			if (ret == 1 && target_total_block_ns >= HZ_TO_NSEC_NUM) {
+				target_task = this->task;
+				need_switch = true;
 			}
+#endif
 
 			if (ret >= nr_wake)
 				break;
@@ -211,9 +223,15 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 
 	spin_unlock(&hb->lock);
 	wake_up_q(&wake_q);
-	if (need_sleep) {
-		schedule_timeout_interruptible(2 * HZ_TO_MSEC_NUM);
+#ifdef CONFIG_SMP
+	if (need_switch) {
+		u64 start_block_ns = now;
+		schedule_timeout_interruptible(1);
+		u64 end_block_ns = ktime_get_ns();
+		atomic64_set(&current->futex_total_block_ns,
+			     end_block_ns - start_block_ns);
 	}
+#endif
 	return ret;
 }
 
@@ -666,13 +684,16 @@ int __futex_wait(u32 __user *uaddr, unsigned int flags, u32 val,
 {
 	struct futex_q q = futex_q_init;
 	struct futex_hash_bucket *hb;
-	u64 start_block_ns, end_block_ns;
+	u64 start_block_ns;
 	int ret;
 
 	if (!bitset)
 		return -EINVAL;
 
 	q.bitset = bitset;
+
+	start_block_ns = ktime_get_ns();
+	q.start_block_ns = start_block_ns;
 
 retry:
 	/*
@@ -683,27 +704,19 @@ retry:
 	if (ret)
 		return ret;
 
-	start_block_ns = ktime_get_ns();
-	/*
-	 * If futex_wait trigger time minus futex_wake wake time is larger than 10us, 
-	 * then we can say this task won the futex_wait compete in userspace.
-	 */
-	if (start_block_ns - atomic64_read(&q.last_wake_ns) > 10000)
-		atomic64_set(&current->futex_total_block_ns, 0);
-
 	/* futex_queue and wait for wakeup, timeout, or a signal. */
 	futex_wait_queue(hb, &q, to);
 
-	end_block_ns = ktime_get_ns();
-	u64 total_block_ns = atomic64_read(&current->futex_total_block_ns);
-	atomic64_set(&current->futex_total_block_ns, total_block_ns + end_block_ns - start_block_ns);
-
 	/* If we were woken (and unqueued), we succeeded, whatever. */
-	if (!futex_unqueue(&q))
-		return 0;
+	if (!futex_unqueue(&q)) {
+		ret = 0;
+		goto done;
+	}
 
-	if (to && !to->task)
-		return -ETIMEDOUT;
+	if (to && !to->task) {
+		ret = -ETIMEDOUT;
+		goto done;
+	}
 
 	/*
 	 * We expect signal_pending(current), but we might be the
@@ -712,7 +725,9 @@ retry:
 	if (!signal_pending(current))
 		goto retry;
 
-	return -ERESTARTSYS;
+	ret = -ERESTARTSYS;
+done:
+	return ret;
 }
 
 int futex_wait(u32 __user *uaddr, unsigned int flags, u32 val, ktime_t *abs_time, u32 bitset)
